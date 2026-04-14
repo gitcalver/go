@@ -1,0 +1,4 @@
+# Copyright © 2026 Michael Shields
+# SPDX-License-Identifier: MIT
+
+defaultBaseImage: gcr.io/distroless/static-debian13:nonroot
