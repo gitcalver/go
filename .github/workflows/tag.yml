@@ -1,0 +1,19 @@
+name: Tag
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  tag:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+      - uses: gitcalver/sh@ba3cb35cd5ee02b58706c6191c44f8d197315069 # v20260414.6
+        with:
+          prefix: 'v0.'
+          tag: 'true'
