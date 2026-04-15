@@ -1,5 +1,7 @@
 # gitcalver
 
+[![Go Reference](https://pkg.go.dev/badge/gitcalver.org/go.svg)](https://pkg.go.dev/gitcalver.org/go)
+
 A Go implementation of [GitCalVer](https://gitcalver.org), which derives
 calendar-based version numbers from git history.
 
