@@ -4,7 +4,7 @@ go 1.25.0
 
 toolchain go1.26.2
 
-require github.com/go-git/go-git/v5 v5.17.2
+require github.com/go-git/go-git/v5 v5.18.0
 
 require (
 	4d63.com/gocheckcompilerdirectives v1.3.0 // indirect
