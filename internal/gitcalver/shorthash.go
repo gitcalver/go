@@ -1,3 +1,6 @@
+// Copyright © 2026 Michael Shields
+// SPDX-License-Identifier: MIT
+
 package gitcalver
 
 import "github.com/go-git/go-git/v5/plumbing"
