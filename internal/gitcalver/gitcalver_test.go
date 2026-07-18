@@ -7,14 +7,18 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	git "github.com/go-git/go-git/v5"
+	"github.com/go-git/go-git/v5/config"
 	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/go-git/go-git/v5/plumbing/object"
+	"github.com/go-git/go-git/v5/storage"
+	"github.com/go-git/go-git/v5/storage/memory"
 )
 
 func testRepo(t *testing.T) (string, func(dateStr string)) {
@@ -152,6 +156,17 @@ func TestPrefix(t *testing.T) {
 			assertEqual(t, tc.want, out)
 		})
 	}
+}
+
+func TestPrefixValidationAndReverseRequirement(t *testing.T) {
+	t.Parallel()
+	dir, commitAt := testRepo(t)
+	commitAt("2026-04-10T09:00:00Z")
+
+	_, code := runCmd(t, dir, "--prefix", "release/\n0.")
+	assertEqual(t, 1, code)
+	_, code = runCmd(t, dir, "--prefix", "v0.", "20260410.1")
+	assertEqual(t, 1, code)
 }
 
 // --- Dirty workspace ---
@@ -381,6 +396,10 @@ func TestOffBranchNotTraceable(t *testing.T) {
 
 	_, code := runCmd(t, dir, "--dirty", "-dirty")
 	assertEqual(t, 3, code)
+
+	wt.Checkout(&git.CheckoutOptions{Branch: plumbing.NewBranchReferenceName("main")})
+	_, code = runCmd(t, dir, orphanHash.String())
+	assertEqual(t, 3, code)
 }
 
 // --- Error cases ---
@@ -389,6 +408,8 @@ func TestNotARepo(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
 	_, code := runCmd(t, dir)
+	assertEqual(t, 1, code)
+	_, code = runCmd(t, dir, "20260410.1")
 	assertEqual(t, 1, code)
 }
 
@@ -400,6 +421,33 @@ func TestEmptyRepo(t *testing.T) {
 	})
 	_, code := runCmd(t, dir)
 	assertEqual(t, 1, code)
+	_, code = runCmd(t, dir, "20260410.1")
+	assertEqual(t, 1, code)
+}
+
+func TestRepositoryOpenDetection(t *testing.T) {
+	t.Parallel()
+	t.Run("parent repository", func(t *testing.T) {
+		t.Parallel()
+		dir, commitAt := testRepo(t)
+		commitAt("2026-04-10T09:00:00Z")
+		nested := filepath.Join(dir, "nested")
+		if err := os.Mkdir(nested, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		out, code := runCmd(t, nested)
+		assertEqual(t, 0, code)
+		assertEqual(t, "20260410.1", out)
+	})
+	t.Run("invalid metadata", func(t *testing.T) {
+		t.Parallel()
+		dir := t.TempDir()
+		if err := os.Mkdir(filepath.Join(dir, ".git"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		_, code := runCmd(t, dir)
+		assertEqual(t, 1, code)
+	})
 }
 
 func TestBranchDetectionFails(t *testing.T) {
@@ -443,8 +491,9 @@ func TestWalkFirstParentInvalidHash(t *testing.T) {
 	commitAt("2026-04-10T09:00:00Z")
 
 	repo, _ := git.PlainOpen(dir)
+	history, _ := newHistory(repo)
 
-	_, _, err := walkFirstParent(repo, plumbing.NewHash("deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"))
+	_, _, err := walkFirstParent(history, plumbing.NewHash("deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"))
 	if err == nil {
 		t.Fatal("expected error")
 	}
@@ -457,11 +506,12 @@ func TestWalkFirstParentCorruptParent(t *testing.T) {
 	commitAt("2026-04-10T10:00:00Z")
 
 	repo, _ := git.PlainOpen(dir)
+	history, _ := newHistory(repo)
 	headRef, _ := repo.Head()
 	head, _ := repo.CommitObject(headRef.Hash())
 	removeObject(t, dir, head.ParentHashes[0])
 
-	_, _, err := walkFirstParent(repo, headRef.Hash())
+	_, _, err := walkFirstParent(history, headRef.Hash())
 	if err == nil {
 		t.Fatal("expected error")
 	}
@@ -510,7 +560,7 @@ func TestForwardBranchCheckError(t *testing.T) {
 	removeObject(t, dir, headRef.Hash())
 
 	_, code := runCmd(t, dir, parent.Hash.String())
-	assertEqual(t, 1, code)
+	assertEqual(t, 4, code)
 }
 
 func TestReverseCorruptBranchTip(t *testing.T) {
@@ -523,7 +573,7 @@ func TestReverseCorruptBranchTip(t *testing.T) {
 	removeObject(t, dir, headRef.Hash())
 
 	_, code := runCmd(t, dir, "20260410.1")
-	assertEqual(t, 1, code)
+	assertEqual(t, 4, code)
 }
 
 func TestReverseCorruptParent(t *testing.T) {
@@ -540,7 +590,7 @@ func TestReverseCorruptParent(t *testing.T) {
 	removeObject(t, dir, middle.Hash)
 
 	_, code := runCmd(t, dir, "20260410.1")
-	assertEqual(t, 1, code)
+	assertEqual(t, 4, code)
 }
 
 func TestMainCorruptRepo(t *testing.T) { //nolint:paralleltest // t.Chdir is incompatible with t.Parallel
@@ -557,10 +607,57 @@ func TestMainCorruptRepo(t *testing.T) { //nolint:paralleltest // t.Chdir is inc
 
 	var stdout, stderr strings.Builder
 	code := Main([]string{"--branch", "main"}, &stdout, &stderr)
-	assertEqual(t, 1, code)
+	assertEqual(t, 4, code)
 	if stderr.Len() == 0 {
 		t.Fatal("expected error output")
 	}
+}
+
+func TestSelectedBranchTipMissing(t *testing.T) {
+	t.Parallel()
+	dir, commitAt := testRepo(t)
+	commitAt("2026-04-10T09:00:00Z")
+
+	repo, _ := git.PlainOpen(dir)
+	missing := plumbing.NewHash("deadbeefdeadbeefdeadbeefdeadbeefdeadbeef")
+	if err := repo.Storer.SetReference(plumbing.NewHashReference(
+		plumbing.NewBranchReferenceName("broken"), missing,
+	)); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, target := range []string{"HEAD", "20260410.1"} {
+		_, code := runCmd(t, dir, "--branch", "broken", target)
+		assertEqual(t, 4, code)
+	}
+}
+
+func TestIncompleteMetadataErrors(t *testing.T) {
+	t.Parallel()
+	t.Run("graft", func(t *testing.T) {
+		t.Parallel()
+		dir, commitAt := testRepo(t)
+		commitAt("2026-04-10T09:00:00Z")
+		if err := os.Mkdir(filepath.Join(dir, ".git", "info"), 0o755); err != nil && !errors.Is(err, os.ErrExist) {
+			t.Fatal(err)
+		}
+		path := filepath.Join(dir, ".git", "info", "grafts")
+		if err := os.WriteFile(path, []byte("graft\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		_, code := runCmd(t, dir)
+		assertEqual(t, 4, code)
+	})
+	t.Run("unreadable shallow data", func(t *testing.T) {
+		t.Parallel()
+		dir, commitAt := testRepo(t)
+		commitAt("2026-04-10T09:00:00Z")
+		if err := os.Mkdir(filepath.Join(dir, ".git", "shallow"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		_, code := runCmd(t, dir)
+		assertEqual(t, 4, code)
+	})
 }
 
 // --- First-parent / merge behavior ---
@@ -720,6 +817,8 @@ func TestDecreasingDatesExits1(t *testing.T) {
 
 	_, code := runCmd(t, dir)
 	assertEqual(t, 1, code)
+	_, code = runCmd(t, dir, "20260410.1")
+	assertEqual(t, 1, code)
 }
 
 // --- Empty commits ---
@@ -833,7 +932,7 @@ func TestReverseShort(t *testing.T) {
 
 	repo, _ := git.PlainOpen(dir)
 	headRef, _ := repo.Head()
-	expectedShort := headRef.Hash().String()[:shortHashLen]
+	expectedShort := headRef.Hash().String()[:objectIDPrefixLen]
 
 	out, code := runCmd(t, dir, "--short", "20260410.1")
 	assertEqual(t, 0, code)
@@ -908,6 +1007,8 @@ func TestReverseInvalidCount(t *testing.T) {
 
 	_, code := runCmd(t, dir, "20260410.0")
 	assertEqual(t, 1, code)
+	_, code = runCmd(t, dir, "20260410.999999999999999999999999999999999999")
+	assertEqual(t, 1, code)
 }
 
 // --- Forward for specific revision ---
@@ -944,6 +1045,44 @@ func TestSpecificRevisionWithPrefix(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertEqual(t, "0.20260410.1", out)
+}
+
+func TestAnnotatedTagRevision(t *testing.T) {
+	t.Parallel()
+	dir, commitAt := testRepo(t)
+	commitAt("2026-04-10T09:00:00Z")
+
+	repo, _ := git.PlainOpen(dir)
+	head, _ := repo.Head()
+	when, _ := time.Parse(time.RFC3339, "2026-04-10T10:00:00Z")
+	tag := &object.Tag{
+		Name:       "annotated",
+		Tagger:     object.Signature{Name: "Test", Email: "test@test.com", When: when},
+		Message:    "annotated tag",
+		TargetType: plumbing.CommitObject,
+		Target:     head.Hash(),
+	}
+	encoded := repo.Storer.NewEncodedObject()
+	if err := tag.Encode(encoded); err != nil {
+		t.Fatal(err)
+	}
+	tagHash, err := repo.Storer.SetEncodedObject(encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = repo.Storer.SetReference(plumbing.NewHashReference(
+		plumbing.NewTagReferenceName("annotated"), tagHash,
+	)); err != nil {
+		t.Fatal(err)
+	}
+
+	out, code := runCmd(t, dir, "annotated")
+	assertEqual(t, 0, code)
+	assertEqual(t, "20260410.1", out)
+
+	commit, _ := repo.CommitObject(head.Hash())
+	_, code = runCmd(t, dir, commit.TreeHash.String())
+	assertEqual(t, 1, code)
 }
 
 // --- CLI parsing ---
@@ -1003,7 +1142,9 @@ func TestParseArgsAllFlags(t *testing.T) {
 		"--dirty", "-dirty",
 		"--no-dirty-hash",
 		"--branch", "develop",
+		"--remote", "upstream",
 		"--short",
+		"--version",
 		"abc123",
 	})
 	if err != nil {
@@ -1013,8 +1154,19 @@ func TestParseArgsAllFlags(t *testing.T) {
 	assertEqual(t, "-dirty", opts.Dirty)
 	assertEqual(t, true, opts.NoDirtyHash)
 	assertEqual(t, "develop", opts.Branch)
+	assertEqual(t, "upstream", opts.Remote)
 	assertEqual(t, true, opts.Short)
+	assertEqual(t, true, opts.showVersion)
 	assertEqual(t, "abc123", opts.Target)
+}
+
+func TestParseArgsRemoteErrors(t *testing.T) {
+	t.Parallel()
+	for _, args := range [][]string{{"--remote"}, {"--remote", ""}} {
+		if _, err := parseArgs(args); err == nil {
+			t.Fatalf("expected error for %q", args)
+		}
+	}
 }
 
 // --- Main function ---
@@ -1027,6 +1179,14 @@ func TestMainHelp(t *testing.T) {
 	if !strings.Contains(stdout.String(), "Usage:") {
 		t.Fatal("expected help output")
 	}
+}
+
+func TestMainVersion(t *testing.T) {
+	t.Parallel()
+	var stdout, stderr strings.Builder
+	code := Main([]string{"--version"}, &stdout, &stderr)
+	assertEqual(t, 0, code)
+	assertEqual(t, "gitcalver (development)", strings.TrimSpace(stdout.String()))
 }
 
 func TestMainInvalidOption(t *testing.T) {
@@ -1102,9 +1262,9 @@ func TestShortHashBasic(t *testing.T) {
 	repo, _ := git.PlainOpen(dir)
 	headRef, _ := repo.Head()
 
-	short := shortHash(headRef.Hash())
-	if len(short) != shortHashLen {
-		t.Fatalf("expected %d-char hash, got %q", shortHashLen, short)
+	short := objectIDPrefix(headRef.Hash())
+	if len(short) != objectIDPrefixLen {
+		t.Fatalf("expected %d-char hash, got %q", objectIDPrefixLen, short)
 	}
 	if !strings.HasPrefix(headRef.Hash().String(), short) {
 		t.Fatalf("short hash %q is not prefix of %q", short, headRef.Hash().String())
@@ -1119,6 +1279,10 @@ func TestExitErrorMessage(t *testing.T) {
 	t.Parallel()
 	e := &ExitError{Code: 2, Message: "test error"}
 	assertEqual(t, "test error", e.Error())
+	assertEqual(t, e, normalizeExitError(e))
+	plain := normalizeExitError(errors.New("plain error"))
+	assertEqual(t, exitError, plain.Code)
+	assertEqual(t, "plain error", plain.Message)
 }
 
 // --- Branch detection ---
@@ -1147,6 +1311,31 @@ func TestDetectBranchOverride(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertEqual(t, "main", branch.name)
+}
+
+func TestDetectBranchFullRefOverride(t *testing.T) {
+	t.Parallel()
+	dir, commitAt := testRepo(t)
+	commitAt("2026-04-10T09:00:00Z")
+
+	repo, _ := git.PlainOpen(dir)
+	branch, err := detectBranch(repo, "refs/heads/main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertEqual(t, "refs/heads/main", branch.name)
+}
+
+func TestDetectBranchEmptyRemote(t *testing.T) {
+	t.Parallel()
+	dir, commitAt := testRepo(t)
+	commitAt("2026-04-10T09:00:00Z")
+
+	repo, _ := git.PlainOpen(dir)
+	_, err := detectBranch(repo, "", "")
+	if err == nil {
+		t.Fatal("expected an empty-remote error")
+	}
 }
 
 func TestDetectBranchOverrideNotFound(t *testing.T) {
@@ -1315,6 +1504,44 @@ func TestCheckBranchRelationDivergenceViaBranchWalk(t *testing.T) {
 	assertEqual(t, relationOffBranch, check.relation)
 }
 
+func TestCheckBranchRelationNotTraceable(t *testing.T) {
+	t.Parallel()
+	dir, commitAt := testRepo(t)
+	commitAt("2026-04-10T09:00:00Z")
+
+	repo, _ := git.PlainOpen(dir)
+	mainRef, _ := repo.Head()
+	mainCommit, _ := repo.CommitObject(mainRef.Hash())
+	orphan := writeCommit(t, repo, mainCommit.TreeHash, nil, "2026-04-11T09:00:00Z")
+
+	check, err := checkBranchRelation(
+		repo,
+		orphan,
+		branchInfo{name: "main", hash: mainRef.Hash()},
+		false,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertEqual(t, relationNotTraceable, check.relation)
+}
+
+func TestCheckBranchRelationUnreadableShallowData(t *testing.T) {
+	t.Parallel()
+	dir, commitAt := testRepo(t)
+	commitAt("2026-04-10T09:00:00Z")
+
+	repo, _ := git.PlainOpen(dir)
+	head, _ := repo.Head()
+	branch := branchInfo{name: "main", hash: head.Hash()}
+	if err := os.Mkdir(filepath.Join(dir, ".git", "shallow"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := checkBranchRelation(repo, head.Hash(), branch, false); err == nil {
+		t.Fatal("expected shallow metadata error")
+	}
+}
+
 // --- HEAD as explicit target ---
 
 func TestForwardExplicitHEADDirtyCheck(t *testing.T) {
@@ -1324,7 +1551,7 @@ func TestForwardExplicitHEADDirtyCheck(t *testing.T) {
 	os.WriteFile(filepath.Join(dir, "dirty.txt"), []byte("dirty"), 0o644)
 
 	_, code := runCmd(t, dir, "HEAD")
-	assertEqual(t, 2, code)
+	assertEqual(t, 0, code)
 }
 
 // --- Remote branch detection ---
@@ -1448,7 +1675,7 @@ func TestShortInForwardModeError(t *testing.T) {
 
 // --- Shallow clone ---
 
-func TestShallowCloneRejected(t *testing.T) {
+func TestShallowCloneIncompleteDateBlock(t *testing.T) {
 	t.Parallel()
 	remoteDir, commitAt := testRepo(t)
 	commitAt("2026-04-10T09:00:00Z")
@@ -1464,10 +1691,265 @@ func TestShallowCloneRejected(t *testing.T) {
 	}
 
 	out, code := runCmd(t, localDir)
-	assertEqual(t, 1, code)
-	if !strings.Contains(out, "shallow") {
-		t.Fatalf("expected shallow clone error, got %q", out)
+	assertEqual(t, 4, code)
+	if !strings.Contains(out, "history") {
+		t.Fatalf("expected incomplete-history error, got %q", out)
 	}
+}
+
+func TestMissingPromisorCommitIsIncomplete(t *testing.T) {
+	t.Parallel()
+	dir, commitAt := testRepo(t)
+	commitAt("2026-04-10T09:00:00Z")
+	commitAt("2026-04-11T09:00:00Z")
+
+	repo, _ := git.PlainOpen(dir)
+	head, _ := repo.Head()
+	commit, _ := repo.CommitObject(head.Hash())
+	removeObject(t, dir, commit.ParentHashes[0])
+
+	configPath := filepath.Join(dir, ".git", "config")
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	configText := strings.Replace(string(data), "repositoryformatversion = 0", "repositoryformatversion = 1", 1)
+	configText += "\n[extensions]\n\tpartialClone = blocked\n"
+	if err = os.WriteFile(configPath, []byte(configText), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err = openRepository(dir, false); err != nil {
+		t.Fatalf("open partial repository: %T: %v", err, err)
+	}
+	_, code := runCmd(t, dir, "HEAD")
+	assertEqual(t, 4, code)
+}
+
+func TestPartialCloneStorageErrors(t *testing.T) {
+	t.Parallel()
+	base := memory.NewStorage()
+	storerWithoutExtensions := &partialCloneStorer{Storer: base}
+	cfg, err := storerWithoutExtensions.Config()
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertEqual(t, false, cfg.Raw.HasSection("extensions"))
+
+	storer := &partialCloneStorer{Storer: &configErrorStorer{Storer: base}}
+	if _, err := storer.Config(); err == nil {
+		t.Fatal("expected config error")
+	}
+	if _, err := openRepositoryIgnoringPartialClone(t.TempDir()); err == nil {
+		t.Fatal("expected repository discovery error")
+	}
+}
+
+func TestPartialCloneLinkedWorktreeStorage(t *testing.T) {
+	t.Parallel()
+	dir, commitAt := testRepo(t)
+	commitAt("2026-04-10T09:00:00Z")
+	linked := filepath.Join(t.TempDir(), "linked")
+	cmd := exec.Command("git", "-C", dir, "worktree", "add", "--detach", linked, "HEAD")
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git worktree add: %v: %s", err, output)
+	}
+
+	repo, err := openRepositoryIgnoringPartialClone(linked)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = repo.Head(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestGitDirectoryDiscovery(t *testing.T) {
+	t.Parallel()
+	t.Run("non-directory", func(t *testing.T) {
+		t.Parallel()
+		path := filepath.Join(t.TempDir(), "file")
+		if err := os.WriteFile(path, nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := findGitDirs(path); err == nil {
+			t.Fatal("expected non-directory error")
+		}
+	})
+	t.Run("not a repository", func(t *testing.T) {
+		t.Parallel()
+		if _, err := findGitDirs(t.TempDir()); err == nil {
+			t.Fatal("expected discovery error")
+		}
+	})
+	t.Run("invalid git file", func(t *testing.T) {
+		t.Parallel()
+		dir := t.TempDir()
+		if err := os.WriteFile(filepath.Join(dir, ".git"), []byte("invalid\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := findGitDirs(dir); err == nil {
+			t.Fatal("expected invalid .git error")
+		}
+	})
+	t.Run("relative git file", func(t *testing.T) {
+		t.Parallel()
+		dir := t.TempDir()
+		gitDir := filepath.Join(dir, "metadata")
+		if err := os.Mkdir(gitDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, ".git"), []byte("gitdir: metadata\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		dirs, err := findGitDirs(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		assertEqual(t, gitDir, dirs.gitDir)
+	})
+	t.Run("absolute common directory", func(t *testing.T) {
+		t.Parallel()
+		dir := t.TempDir()
+		gitDir := filepath.Join(dir, "metadata")
+		commonDir := filepath.Join(dir, "common")
+		if err := os.Mkdir(gitDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Mkdir(commonDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, ".git"), []byte("gitdir: "+gitDir+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(gitDir, "commondir"), []byte(commonDir+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		dirs, err := findGitDirs(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		assertEqual(t, commonDir, dirs.commonDir)
+	})
+	t.Run("unreadable common directory", func(t *testing.T) {
+		t.Parallel()
+		dir := t.TempDir()
+		gitDir := filepath.Join(dir, "metadata")
+		if err := os.Mkdir(gitDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, ".git"), []byte("gitdir: metadata\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Mkdir(filepath.Join(gitDir, "commondir"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := findGitDirs(dir); err == nil {
+			t.Fatal("expected commondir read error")
+		}
+	})
+	t.Run("git file stat error", func(t *testing.T) {
+		t.Parallel()
+		dir := t.TempDir()
+		if err := os.Symlink(".git", filepath.Join(dir, ".git")); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := gitDirAt(dir); err == nil {
+			t.Fatal("expected symlink-loop error")
+		}
+	})
+	t.Run("git file read error", func(t *testing.T) {
+		t.Parallel()
+		dir := t.TempDir()
+		path := filepath.Join(dir, ".git")
+		if err := os.WriteFile(path, []byte("gitdir: metadata\n"), 0o000); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			if err := os.Chmod(path, 0o600); err != nil {
+				t.Error(err)
+			}
+		})
+		if _, _, err := gitDirAt(dir); err == nil {
+			t.Fatal("expected .git read error")
+		}
+	})
+}
+
+func TestTargetBranchAnchorDeduplicatesMergeParents(t *testing.T) {
+	t.Parallel()
+	dir, commitAt := testRepo(t)
+	commitAt("2026-04-10T09:00:00Z")
+	repo, _ := git.PlainOpen(dir)
+	head, _ := repo.Head()
+	commit, _ := repo.CommitObject(head.Hash())
+	merge := writeCommit(
+		t,
+		repo,
+		commit.TreeHash,
+		[]plumbing.Hash{head.Hash(), head.Hash()},
+		"2026-04-10T10:00:00Z",
+	)
+	history, _ := newHistory(repo)
+	anchor := targetBranchAnchor(
+		history,
+		merge,
+		map[plumbing.Hash]int{head.Hash(): 0},
+	)
+	assertEqual(t, false, anchor.incomplete)
+	assertEqual(t, true, anchor.found)
+	assertEqual(t, head.Hash(), anchor.hash)
+
+	history.shallow[merge] = struct{}{}
+	anchor = targetBranchAnchor(history, merge, nil)
+	assertEqual(t, true, anchor.incomplete)
+	assertEqual(t, false, anchor.found)
+}
+
+func TestTargetBranchAnchorChoosesNewestIntersection(t *testing.T) {
+	t.Parallel()
+	dir, commitAt := testRepo(t)
+	commitAt("2026-04-10T09:00:00Z")
+	repo, _ := git.PlainOpen(dir)
+	baseRef, _ := repo.Head()
+	base, _ := repo.CommitObject(baseRef.Hash())
+
+	commitAt("2026-04-11T09:00:00Z")
+	newerRef, _ := repo.Head()
+	newer, _ := repo.CommitObject(newerRef.Hash())
+	commitAt("2026-04-12T09:00:00Z")
+	tipRef, _ := repo.Head()
+
+	offChain := writeCommit(
+		t,
+		repo,
+		newer.TreeHash,
+		[]plumbing.Hash{newer.Hash},
+		"2026-04-13T09:00:00Z",
+	)
+	target := writeCommit(
+		t,
+		repo,
+		newer.TreeHash,
+		[]plumbing.Hash{base.Hash, offChain},
+		"2026-04-14T09:00:00Z",
+	)
+	history, _ := newHistory(repo)
+	selectedChain, err := selectedBranchPositions(
+		history,
+		tipRef.Hash(),
+		target,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertEqual(t, false, selectedChain.incomplete)
+	assertEqual(t, false, selectedChain.targetOnBranch)
+
+	anchor := targetBranchAnchor(history, target, selectedChain.positions)
+	assertEqual(t, false, anchor.incomplete)
+	assertEqual(t, true, anchor.found)
+	assertEqual(t, newer.Hash, anchor.hash)
 }
 
 // --- Leading zeros in version ---
@@ -1581,7 +2063,7 @@ func TestForwardMergeBaseError(t *testing.T) {
 	removeObject(t, dir, c1Hash)
 
 	_, code := runCmd(t, dir, "--dirty", "-dirty")
-	assertEqual(t, 1, code)
+	assertEqual(t, 4, code)
 }
 
 // --- Bare repo ---
@@ -1629,8 +2111,13 @@ func TestForwardBareRepo(t *testing.T) {
 	repo.Storer.SetReference(plumbing.NewSymbolicReference(
 		plumbing.HEAD, plumbing.NewBranchReferenceName("main"),
 	))
+	enablePartialClone(t, filepath.Join(dir, "config"))
 
-	out, err := forward(repo, &Options{Branch: "main"})
+	state, err := validateRepo(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := forward(state, &Options{Branch: "main"}, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1703,10 +2190,61 @@ func TestForwardCorruptIndexStatusError(t *testing.T) {
 	os.WriteFile(filepath.Join(dir, ".git", "index"), []byte("corrupt"), 0o644)
 
 	_, code := runCmd(t, dir)
-	assertEqual(t, 1, code)
+	assertEqual(t, 4, code)
 }
 
 // --- Helpers ---
+
+type configErrorStorer struct {
+	storage.Storer
+}
+
+func (*configErrorStorer) Config() (*config.Config, error) {
+	return nil, errors.New("config error")
+}
+
+func writeCommit(
+	t *testing.T,
+	repo *git.Repository,
+	tree plumbing.Hash,
+	parents []plumbing.Hash,
+	date string,
+) plumbing.Hash {
+	t.Helper()
+	when, err := time.Parse(time.RFC3339, date)
+	if err != nil {
+		t.Fatal(err)
+	}
+	signature := object.Signature{Name: "Test", Email: "test@test.com", When: when}
+	commit := &object.Commit{
+		Author:       signature,
+		Committer:    signature,
+		Message:      "commit",
+		TreeHash:     tree,
+		ParentHashes: parents,
+	}
+	encoded := repo.Storer.NewEncodedObject()
+	if err = commit.Encode(encoded); err != nil {
+		t.Fatal(err)
+	}
+	hash, err := repo.Storer.SetEncodedObject(encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return hash
+}
+
+func enablePartialClone(t *testing.T, configPath string) {
+	t.Helper()
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data = append(data, []byte("\n[extensions]\n\tpartialClone = blocked\n")...)
+	if err = os.WriteFile(configPath, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
 
 func removeObject(t *testing.T, dir string, hash plumbing.Hash) {
 	t.Helper()

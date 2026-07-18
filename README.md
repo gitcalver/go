@@ -44,6 +44,9 @@ $ gitcalver
 20260411.3
 ```
 
+An omitted target checks the workspace. An explicit revision, including
+`HEAD`, calculates that commit’s version without considering workspace changes.
+
 ### Version prefix
 
 Use `--prefix` to prepend a string to the version number, e.g.:
@@ -90,15 +93,25 @@ Dirty versions cannot be reversed.
 | `--dirty STRING`    | Enable dirty versions; append STRING.HASH      |
 | `--no-dirty`        | Refuse dirty versions (overrides `--dirty`)    |
 | `--no-dirty-hash`   | Suppress .HASH suffix (requires `--dirty`)     |
-| `--branch BRANCH`   | Base branch name (e.g. `main`); overrides auto-detection. This is the branch versions are minted on, not the branch you are working on. |
-| `--short`           | Output short commit hash (reverse lookup mode) |
+| `--branch BRANCH`   | Override the branch whose first-parent chain defines versions |
+| `--remote REMOTE`   | Select the cached remote used for branch detection; never fetches |
+| `--short`           | Output the first seven object-ID characters in reverse mode |
+| `--version`         | Show the gitcalver build version                   |
 | `--help`            | Show help                                      |
 
 ### Exit codes
 
-| Code | Meaning                                |
-|------|----------------------------------------|
-| 0    | Success                                |
-| 1    | Error (not a git repo, no commits, non-monotonic dates, shallow clone) |
-| 2    | Dirty workspace or off default branch (without `--dirty`) |
-| 3    | Cannot trace to default branch         |
+| Code | Meaning                                                     |
+|------|-------------------------------------------------------------|
+| 0    | Success                                                     |
+| 1    | Invalid input or repository state                           |
+| 2    | Dirty workspace or off selected branch without `--dirty`    |
+| 3    | Complete history proves the target is on an unrelated chain |
+| 4    | Local history is insufficient to prove the result           |
+
+## History requirements
+
+Calculations are always offline. Shallow and partial clones work when their
+local commit objects prove the selected first-parent relationship, anchor, and
+complete relevant UTC date block. Missing promised commits return exit code 4;
+GitCalVer never fetches them during calculation.

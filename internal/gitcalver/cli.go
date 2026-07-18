@@ -19,9 +19,13 @@ Options:
   --no-dirty          Refuse dirty versions (overrides --dirty)
   --no-dirty-hash     Suppress the .HASH suffix (requires --dirty)
   --branch BRANCH     Base branch name (e.g. "main"); overrides auto-detection
-  --short             Output short commit hash (reverse mode only)
+  --remote REMOTE     Remote used for cached branch detection (default: origin)
+  --short             Output first seven object-ID characters (reverse mode)
+  --version           Show version and exit
   --help              Show this help
 `
+
+var buildVersion = "(development)"
 
 var (
 	errHelp          = errors.New("help requested")
@@ -31,6 +35,8 @@ var (
 	errDirtyEmpty    = errors.New("--dirty must not be empty")
 	errNoDirtyHash   = errors.New("--no-dirty-hash requires --dirty")
 	errBranchArg     = errors.New("--branch requires an argument")
+	errRemoteArg     = errors.New("--remote requires an argument")
+	errRemoteEmpty   = errors.New("--remote requires a non-empty argument")
 	errUnexpectedArg = errors.New("unexpected argument")
 )
 
@@ -45,24 +51,32 @@ func Main(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "gitcalver: %s\n", err) //nolint:errcheck // write to stderr is non-actionable
 		return 1
 	}
+	if opts.showVersion {
+		fmt.Fprintf(stdout, "gitcalver %s\n", buildVersion) //nolint:errcheck // write to stdout is non-actionable
+		return 0
+	}
 
 	result, err := Run(opts)
 	if err != nil {
-		var exitErr *ExitError
-		if errors.As(err, &exitErr) {
-			fmt.Fprintf(stderr, "gitcalver: %s\n", exitErr.Message) //nolint:errcheck // write to stderr is non-actionable
-			return exitErr.Code
-		}
-		fmt.Fprintf(stderr, "gitcalver: %s\n", err) //nolint:errcheck // write to stderr is non-actionable
-		return 1
+		exitErr := normalizeExitError(err)
+		fmt.Fprintf(stderr, "gitcalver: %s\n", exitErr.Message) //nolint:errcheck // write to stderr is non-actionable
+		return exitErr.Code
 	}
 
 	fmt.Fprintln(stdout, result) //nolint:errcheck // write to stdout is non-actionable
 	return 0
 }
 
+func normalizeExitError(err error) *ExitError {
+	var exitErr *ExitError
+	if errors.As(err, &exitErr) {
+		return exitErr
+	}
+	return &ExitError{Code: exitError, Message: err.Error()}
+}
+
 func parseArgs(args []string) (*Options, error) {
-	opts := &Options{}
+	opts := &Options{Remote: defaultRemote}
 
 	noDirty := false
 	dirtyWasSet := false
@@ -72,10 +86,11 @@ func parseArgs(args []string) (*Options, error) {
 		arg := args[i]
 
 		if endOfOpts {
-			if opts.Target != "" {
+			if opts.targetSet {
 				return nil, fmt.Errorf("%w: %s", errUnexpectedArg, arg)
 			}
 			opts.Target = arg
+			opts.targetSet = true
 			continue
 		}
 
@@ -108,18 +123,30 @@ func parseArgs(args []string) (*Options, error) {
 			}
 			i++
 			opts.Branch = args[i]
+		case "--remote":
+			if i+1 >= len(args) {
+				return nil, errRemoteArg
+			}
+			i++
+			if args[i] == "" {
+				return nil, errRemoteEmpty
+			}
+			opts.Remote = args[i]
 		case "--short":
 			opts.Short = true
+		case "--version":
+			opts.showVersion = true
 		case "--help":
 			return nil, errHelp
 		default:
 			if len(arg) > 0 && arg[0] == '-' {
 				return nil, fmt.Errorf("%w: %s", errUnknownOption, arg)
 			}
-			if opts.Target != "" {
+			if opts.targetSet {
 				return nil, fmt.Errorf("%w: %s", errUnexpectedArg, arg)
 			}
 			opts.Target = arg
+			opts.targetSet = true
 		}
 	}
 
