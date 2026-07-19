@@ -5,8 +5,10 @@ package gitcalver
 
 import "github.com/go-git/go-git/v5/plumbing"
 
-const shortHashLen = 7
+const objectIDPrefixLen = 7
 
-func shortHash(hash plumbing.Hash) string {
-	return hash.String()[:shortHashLen]
+// objectIDPrefix returns the contract-defined, fixed-width version component.
+// It is not Git's repository-dependent unambiguous abbreviation.
+func objectIDPrefix(hash plumbing.Hash) string {
+	return hash.String()[:objectIDPrefixLen]
 }
