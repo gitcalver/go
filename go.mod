@@ -5,7 +5,7 @@ go 1.25.0
 toolchain go1.26.5
 
 require (
-	github.com/go-git/go-billy/v5 v5.8.0
+	github.com/go-git/go-billy/v5 v5.9.0
 	github.com/go-git/go-git/v5 v5.18.0
 )
 
@@ -100,7 +100,7 @@ require (
 	github.com/coreos/go-oidc/v3 v3.17.0 // indirect
 	github.com/curioswitch/go-reassign v0.3.0 // indirect
 	github.com/cyberphone/json-canonicalization v0.0.0-20241213102144-19d51d7fe467 // indirect
-	github.com/cyphar/filepath-securejoin v0.4.1 // indirect
+	github.com/cyphar/filepath-securejoin v0.6.1 // indirect
 	github.com/daixiang0/gci v0.13.7 // indirect
 	github.com/dave/dst v0.27.3 // indirect
 	github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc // indirect
@@ -332,15 +332,15 @@ require (
 	go.uber.org/zap v1.27.1 // indirect
 	go.yaml.in/yaml/v2 v2.4.3 // indirect
 	go.yaml.in/yaml/v3 v3.0.4 // indirect
-	golang.org/x/crypto v0.49.0 // indirect
+	golang.org/x/crypto v0.50.0 // indirect
 	golang.org/x/exp/typeparams v0.0.0-20260209203927-2842357ff358 // indirect
 	golang.org/x/mod v0.34.0 // indirect
-	golang.org/x/net v0.52.0 // indirect
+	golang.org/x/net v0.53.0 // indirect
 	golang.org/x/oauth2 v0.34.0 // indirect
 	golang.org/x/sync v0.20.0 // indirect
-	golang.org/x/sys v0.42.0 // indirect
-	golang.org/x/term v0.41.0 // indirect
-	golang.org/x/text v0.35.0 // indirect
+	golang.org/x/sys v0.43.0 // indirect
+	golang.org/x/term v0.42.0 // indirect
+	golang.org/x/text v0.36.0 // indirect
 	golang.org/x/tools v0.43.0 // indirect
 	google.golang.org/genproto/googleapis/api v0.0.0-20251213004720-97cd9d5aeac2 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20251213004720-97cd9d5aeac2 // indirect
