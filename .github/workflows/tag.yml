@@ -1,19 +1,29 @@
 name: Tag
 on:
-  push:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
     branches: [main]
 
-permissions:
-  contents: write
+concurrency: release
+
+permissions: {}
 
 jobs:
   tag:
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push'
     runs-on: ubuntu-24.04
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           fetch-depth: 0
-      - uses: gitcalver/sh@ba3cb35cd5ee02b58706c6191c44f8d197315069 # v20260414.6
+          ref: ${{ github.event.workflow_run.head_sha }}
+      - uses: gitcalver/sh@a7f5c0600057d05028467cda8c65b36d5aa1eaf5 # v20260719.1
         with:
           prefix: 'v0.'
+          remote: origin
           tag: 'true'
