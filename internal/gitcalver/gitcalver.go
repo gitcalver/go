@@ -99,7 +99,7 @@ func Run(opts *Options) (string, error) {
 		return reverse(state, opts, lookup)
 	}
 
-	return forward(state, opts, targetSet)
+	return forward(state, opts)
 }
 
 func validateRepo(dir string) (*repoState, error) {
@@ -197,12 +197,12 @@ func openRepositoryIgnoringPartialClone(dir string) (*git.Repository, error) {
 	return git.Open(storer, osfs.New(dirs.worktreeDir))
 }
 
-//nolint:revive // targetSet preserves omitted-versus-explicit CLI semantics.
-func forward(state *repoState, opts *Options, targetSet bool) (string, error) {
+func forward(state *repoState, opts *Options) (string, error) {
 	if opts.Short {
 		return "", &ExitError{exitError, "--short is only valid in reverse lookup mode"}
 	}
 
+	targetSet := opts.targetSet || opts.Target != ""
 	targetHash := state.headHash
 	if targetSet {
 		resolved, err := resolveCommitRevision(state.repo, opts.Target)
@@ -360,7 +360,7 @@ func reverse(state *repoState, opts *Options, lookup string) (string, error) {
 		if commitDate == dateStr {
 			candidates = append(candidates, commit.Hash)
 		} else if commitDate < dateStr {
-			return selectReverseCandidate(candidates, n, opts.Target, opts.Short)
+			break
 		}
 
 		parent, ok, parentErr := state.history.firstParent(commit)
@@ -371,26 +371,30 @@ func reverse(state *repoState, opts *Options, lookup string) (string, error) {
 			}
 		}
 		if !ok {
-			return selectReverseCandidate(candidates, n, opts.Target, opts.Short)
+			break
 		}
 		commit = parent
 	}
-}
 
-//nolint:revive // short selects the contract's alternate reverse output.
-func selectReverseCandidate(
-	candidates []plumbing.Hash, n int, version string, short bool,
-) (string, error) {
-	if n > len(candidates) {
-		return "", &ExitError{exitError, "version not found: " + version}
+	targetHash, err := selectReverseCandidate(candidates, n, opts.Target)
+	if err != nil {
+		return "", err
 	}
-
-	// N=1 is oldest on that date; candidates are newest-first.
-	targetHash := candidates[len(candidates)-n]
-	if short {
+	if opts.Short {
 		return objectIDPrefix(targetHash), nil
 	}
 	return targetHash.String(), nil
+}
+
+func selectReverseCandidate(
+	candidates []plumbing.Hash, n int, version string,
+) (plumbing.Hash, error) {
+	if n > len(candidates) {
+		return plumbing.ZeroHash, &ExitError{exitError, "version not found: " + version}
+	}
+
+	// N=1 is oldest on that date; candidates are newest-first.
+	return candidates[len(candidates)-n], nil
 }
 
 func dateWentBackwards(older, newer string) *ExitError {

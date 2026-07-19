@@ -2117,7 +2117,7 @@ func TestForwardBareRepo(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	out, err := forward(state, &Options{Branch: "main"}, false)
+	out, err := forward(state, &Options{Branch: "main"})
 	if err != nil {
 		t.Fatal(err)
 	}
