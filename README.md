@@ -6,7 +6,10 @@ A Go implementation of [GitCalVer](https://gitcalver.org), which derives
 calendar-based version numbers from git history.
 
 Each commit on the default branch gets a unique, strictly increasing version of
-the form `YYYYMMDD.N`, where `N` is the number of commits on that UTC date.
+the form `YYYYMMDD.N`, where `N` is the size of that commit's date cohort: the
+commits reachable from it through any parent whose UTC committer date is the
+same. Because N reflects reachable history rather than a fixed per-day count,
+sequences are sparse — not every `N` is assigned to a commit.
 
 See the [GitCalVer specification](https://gitcalver.org) for full details.
 
@@ -113,5 +116,6 @@ Dirty versions cannot be reversed.
 
 Calculations are always offline. Shallow and partial clones work when their
 local commit objects prove the selected first-parent relationship, anchor, and
-complete relevant UTC date block. Missing promised commits return exit code 4;
-GitCalVer never fetches them during calculation.
+the target's complete date cohort — every same-date commit reachable through
+any parent, not just the first-parent chain. Missing promised commits return
+exit code 4; GitCalVer never fetches them during calculation.

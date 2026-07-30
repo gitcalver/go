@@ -64,6 +64,29 @@ func (h *history) firstParent(commit *object.Commit) (*object.Commit, bool, erro
 	return parent, true, nil
 }
 
+// parents resolves every parent of commit, in the order git recorded them.
+// A commit with no recorded parents is a true history root, not a boundary.
+// A commit at a shallow boundary still has recorded parent hashes but no
+// locally readable parent objects, so it is reported the same as a commit
+// with a missing parent object.
+func (h *history) parents(commit *object.Commit) ([]*object.Commit, error) {
+	if len(commit.ParentHashes) == 0 {
+		return nil, nil
+	}
+	if _, ok := h.shallow[commit.Hash]; ok {
+		return nil, &ExitError{exitIncompleteHistory, "local history ended at a shallow boundary"}
+	}
+	parents := make([]*object.Commit, len(commit.ParentHashes))
+	for i, hash := range commit.ParentHashes {
+		parent, err := h.commit(hash)
+		if err != nil {
+			return nil, err
+		}
+		parents[i] = parent
+	}
+	return parents, nil
+}
+
 func findReachableBranchAnchor(
 	history *history, targetHash, branchHash plumbing.Hash,
 ) (plumbing.Hash, bool, error) {

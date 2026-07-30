@@ -323,6 +323,42 @@ func TestOffBranchMultipleMainCommits(t *testing.T) {
 	}
 }
 
+func TestOffBranchDirtyAnchorUsesCohortCount(t *testing.T) {
+	t.Parallel()
+	dir, commitAt := testRepo(t)
+	commitAt("2026-04-08T09:00:00Z") // base, older day
+
+	repo, _ := git.PlainOpen(dir)
+	baseRef, _ := repo.Head()
+	base, _ := repo.CommitObject(baseRef.Hash())
+
+	m1 := writeCommit(t, repo, base.TreeHash, []plumbing.Hash{baseRef.Hash()}, "2026-04-10T09:00:00Z")
+	s1 := writeCommit(t, repo, base.TreeHash, []plumbing.Hash{baseRef.Hash()}, "2026-04-10T10:00:00Z")
+	merge := writeCommit(t, repo, base.TreeHash, []plumbing.Hash{m1, s1}, "2026-04-10T11:00:00Z")
+	if err := repo.Storer.SetReference(plumbing.NewHashReference(
+		plumbing.NewBranchReferenceName("main"), merge,
+	)); err != nil {
+		t.Fatal(err)
+	}
+
+	// The off-chain target hangs off the merge, so its anchor is the merge
+	// itself, whose cohort {merge, m1, s1} = 3 differs from the naive
+	// first-parent count of 2: a first-parent regression in anchor
+	// versioning would surface here as 20260410.2-dirty.
+	f1 := writeCommit(t, repo, base.TreeHash, []plumbing.Hash{merge}, "2026-04-10T12:00:00Z")
+
+	out, code := runCmd(t, dir, "--dirty", "-dirty", f1.String())
+	assertEqual(t, 0, code)
+	wantPrefix := "20260410.3-dirty."
+	if !strings.HasPrefix(out, wantPrefix) {
+		t.Fatalf("expected prefix %q, got %q", wantPrefix, out)
+	}
+	hashPart := strings.TrimPrefix(out, wantPrefix)
+	if !strings.HasPrefix(f1.String(), hashPart) {
+		t.Fatalf("hash should be prefix of target %s, got %q", f1, hashPart)
+	}
+}
+
 func TestOffBranchNoDirtyHash(t *testing.T) {
 	t.Parallel()
 	dir, commitAt := testRepo(t)
@@ -485,7 +521,7 @@ func TestBranchDetectionFails(t *testing.T) {
 
 // --- Corrupt repository ---
 
-func TestWalkFirstParentInvalidHash(t *testing.T) {
+func TestCohortCountInvalidHash(t *testing.T) {
 	t.Parallel()
 	dir, commitAt := testRepo(t)
 	commitAt("2026-04-10T09:00:00Z")
@@ -493,13 +529,13 @@ func TestWalkFirstParentInvalidHash(t *testing.T) {
 	repo, _ := git.PlainOpen(dir)
 	history, _ := newHistory(repo)
 
-	_, _, err := walkFirstParent(history, plumbing.NewHash("deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"))
+	_, _, err := cohortCount(history, plumbing.NewHash("deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"))
 	if err == nil {
 		t.Fatal("expected error")
 	}
 }
 
-func TestWalkFirstParentCorruptParent(t *testing.T) {
+func TestCohortCountCorruptParent(t *testing.T) {
 	t.Parallel()
 	dir, commitAt := testRepo(t)
 	commitAt("2026-04-10T09:00:00Z")
@@ -511,7 +547,7 @@ func TestWalkFirstParentCorruptParent(t *testing.T) {
 	head, _ := repo.CommitObject(headRef.Hash())
 	removeObject(t, dir, head.ParentHashes[0])
 
-	_, _, err := walkFirstParent(history, headRef.Hash())
+	_, _, err := cohortCount(history, headRef.Hash())
 	if err == nil {
 		t.Fatal("expected error")
 	}
@@ -731,14 +767,463 @@ func TestReverseThroughMerge(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// First-parent walk: merge(13:00) -> main(12:00) -> base(09:00) = 3.
-	// Feature-branch commits (second parent) must not inflate the count.
-	hash, code := runCmd(t, dir, "20260410.3")
+	// The merge commit's date cohort is itself plus every same-date commit
+	// reachable through any parent: base(09:00), main(12:00) through the
+	// first parent, and both feature commits(10:00, 11:00) through the
+	// second parent — 5 total, not the first-parent-only count of 3.
+	out, code := runCmd(t, dir)
+	assertEqual(t, 0, code)
+	assertEqual(t, "20260410.5", out)
+
+	hash, code := runCmd(t, dir, "20260410.5")
 	assertEqual(t, 0, code)
 	assertEqual(t, mergeHash.String(), hash)
 
-	_, code = runCmd(t, dir, "20260410.4")
+	// The sequence is sparse: the first-parent block's members are
+	// base(.1), main(.2), and merge(.5); .3 and .4 were never assigned.
+	for _, gap := range []string{"20260410.3", "20260410.4"} {
+		_, code = runCmd(t, dir, gap)
+		assertEqual(t, 1, code)
+	}
+}
+
+func TestReverseSparseGapsBothSidesExactHits(t *testing.T) {
+	t.Parallel()
+	dir, commitAt := testRepo(t)
+	commitAt("2026-04-08T09:00:00Z") // base, older day: a boundary, not counted
+
+	repo, _ := git.PlainOpen(dir)
+	baseRef, _ := repo.Head()
+	base, _ := repo.CommitObject(baseRef.Hash())
+
+	c1 := writeCommit(t, repo, base.TreeHash, []plumbing.Hash{baseRef.Hash()}, "2026-04-10T09:00:00Z")
+
+	s1 := writeCommit(t, repo, base.TreeHash, []plumbing.Hash{baseRef.Hash()}, "2026-04-10T10:00:00Z")
+	s2 := writeCommit(t, repo, base.TreeHash, []plumbing.Hash{s1}, "2026-04-10T11:00:00Z")
+	s3 := writeCommit(t, repo, base.TreeHash, []plumbing.Hash{s2}, "2026-04-10T12:00:00Z")
+	s4 := writeCommit(t, repo, base.TreeHash, []plumbing.Hash{s3}, "2026-04-10T13:00:00Z")
+
+	c2 := writeCommit(t, repo, base.TreeHash, []plumbing.Hash{c1, s4}, "2026-04-10T14:00:00Z")
+
+	if err := repo.Storer.SetReference(plumbing.NewHashReference(
+		plumbing.NewBranchReferenceName("main"), c2,
+	)); err != nil {
+		t.Fatal(err)
+	}
+
+	// Block members are c1 (cohort {c1} = 1) and c2 (cohort {c2, c1, s1..s4}
+	// = 6); .2 through .5 were never assigned to any commit.
+	out, code := runCmd(t, dir, "20260410.1")
+	assertEqual(t, 0, code)
+	assertEqual(t, c1.String(), out)
+
+	out, code = runCmd(t, dir, "20260410.6")
+	assertEqual(t, 0, code)
+	assertEqual(t, c2.String(), out)
+
+	for _, gap := range []string{"20260410.2", "20260410.3", "20260410.4", "20260410.5"} {
+		_, code = runCmd(t, dir, gap)
+		assertEqual(t, 1, code)
+	}
+}
+
+// --- Date cohort: pruned-walk semantics (0.3) ---
+
+func TestIncidentTopologyVersionNeverDecreases(t *testing.T) {
+	t.Parallel()
+	dir, commitAt := testRepo(t)
+	commitAt("2026-04-08T09:00:00Z") // base, older day: a boundary
+
+	repo, _ := git.PlainOpen(dir)
+	baseRef, _ := repo.Head()
+	base, _ := repo.CommitObject(baseRef.Hash())
+
+	m1 := writeCommit(t, repo, base.TreeHash, []plumbing.Hash{baseRef.Hash()}, "2026-04-10T09:00:00Z")
+	m2 := writeCommit(t, repo, base.TreeHash, []plumbing.Hash{m1}, "2026-04-10T10:00:00Z")
+	m3 := writeCommit(t, repo, base.TreeHash, []plumbing.Hash{m2}, "2026-04-10T11:00:00Z")
+	m4 := writeCommit(t, repo, base.TreeHash, []plumbing.Hash{m3}, "2026-04-10T12:00:00Z")
+
+	if err := repo.Storer.SetReference(plumbing.NewHashReference(
+		plumbing.NewBranchReferenceName("main"), m4,
+	)); err != nil {
+		t.Fatal(err)
+	}
+
+	// main's own tip version before the incident: a plain 4-commit block.
+	before, err := Run(&Options{Dir: dir, Target: m4.String(), Branch: "main"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertEqual(t, "20260410.4", before)
+
+	// feature branches from base independently of main's own commits.
+	f1 := writeCommit(t, repo, base.TreeHash, []plumbing.Hash{baseRef.Hash()}, "2026-04-10T13:00:00Z")
+
+	// Merge main into feature (feature's own tip f1 is first parent), then
+	// fast-forward main onto the merge. This is the reparenting that made a
+	// first-parent-only count regress: main's own commits (m1..m4) leave the
+	// first-parent chain and are only reachable through the second parent.
+	merge := writeCommit(t, repo, base.TreeHash, []plumbing.Hash{f1, m4}, "2026-04-10T14:00:00Z")
+	if refErr := repo.Storer.SetReference(plumbing.NewHashReference(
+		plumbing.NewBranchReferenceName("main"), merge,
+	)); refErr != nil {
+		t.Fatal(refErr)
+	}
+
+	// Every commit is still reachable, and the date cohort only grows: the
+	// version after the reparenting merge must be strictly greater, matching
+	// the hand-computed cohort {merge, f1, m4, m3, m2, m1} = 6.
+	after, err := Run(&Options{Dir: dir, Target: merge.String(), Branch: "main"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertEqual(t, "20260410.6", after)
+}
+
+func TestSameDaySecondParentCounted(t *testing.T) {
+	t.Parallel()
+	dir, commitAt := testRepo(t)
+	commitAt("2026-04-10T09:00:00Z")
+
+	repo, _ := git.PlainOpen(dir)
+	headRef, _ := repo.Head()
+	base, _ := repo.CommitObject(headRef.Hash())
+
+	side := writeCommit(t, repo, base.TreeHash, []plumbing.Hash{headRef.Hash()}, "2026-04-10T10:00:00Z")
+	merge := writeCommit(t, repo, base.TreeHash, []plumbing.Hash{headRef.Hash(), side}, "2026-04-10T11:00:00Z")
+
+	if err := repo.Storer.SetReference(plumbing.NewHashReference(
+		plumbing.NewBranchReferenceName("main"), merge,
+	)); err != nil {
+		t.Fatal(err)
+	}
+
+	// base + side + merge, all same day: cohort of 3.
+	out, code := runCmd(t, dir, merge.String())
+	assertEqual(t, 0, code)
+	assertEqual(t, "20260410.3", out)
+}
+
+func TestCrossDayMergeNotCounted(t *testing.T) {
+	t.Parallel()
+	dir, commitAt := testRepo(t)
+	commitAt("2026-04-08T09:00:00Z") // base, older day
+
+	repo, _ := git.PlainOpen(dir)
+	headRef, _ := repo.Head()
+	base, _ := repo.CommitObject(headRef.Hash())
+
+	// The second-parent branch stays on the older day.
+	side := writeCommit(t, repo, base.TreeHash, []plumbing.Hash{headRef.Hash()}, "2026-04-08T10:00:00Z")
+	// The first-parent branch (main) advances to a new day.
+	main1 := writeCommit(t, repo, base.TreeHash, []plumbing.Hash{headRef.Hash()}, "2026-04-10T09:00:00Z")
+	merge := writeCommit(t, repo, base.TreeHash, []plumbing.Hash{main1, side}, "2026-04-10T10:00:00Z")
+
+	if err := repo.Storer.SetReference(plumbing.NewHashReference(
+		plumbing.NewBranchReferenceName("main"), merge,
+	)); err != nil {
+		t.Fatal(err)
+	}
+
+	// merge + main1 only; base and side are on the older day and are
+	// pruned, not counted, even though side is reachable through the
+	// second parent.
+	out, code := runCmd(t, dir, merge.String())
+	assertEqual(t, 0, code)
+	assertEqual(t, "20260410.2", out)
+}
+
+func TestSameDateBehindOlderNotCounted(t *testing.T) {
+	t.Parallel()
+	dir, commitAt := testRepo(t)
+	commitAt("2026-04-10T09:00:00Z") // q: shares the target's date but is buried
+
+	repo, _ := git.PlainOpen(dir)
+	headRef, _ := repo.Head()
+	q, _ := repo.CommitObject(headRef.Hash())
+
+	// p is q's child and target's parent, dated *before* its own parent q --
+	// buried clock skew that the pruned walk must never even look at, since
+	// p itself is older than the target and prunes the walk right there.
+	p := writeCommit(t, repo, q.TreeHash, []plumbing.Hash{headRef.Hash()}, "2026-04-09T09:00:00Z")
+	target := writeCommit(t, repo, q.TreeHash, []plumbing.Hash{p}, "2026-04-10T10:00:00Z")
+
+	if err := repo.Storer.SetReference(plumbing.NewHashReference(
+		plumbing.NewBranchReferenceName("main"), target,
+	)); err != nil {
+		t.Fatal(err)
+	}
+
+	out, code := runCmd(t, dir, target.String())
+	assertEqual(t, 0, code)
+	assertEqual(t, "20260410.1", out)
+}
+
+func TestBuriedFutureDateTolerated(t *testing.T) {
+	t.Parallel()
+	dir, commitAt := testRepo(t)
+	commitAt("2027-01-01T09:00:00Z") // q: wildly future-dated, buried behind an older commit
+
+	repo, _ := git.PlainOpen(dir)
+	headRef, _ := repo.Head()
+	q, _ := repo.CommitObject(headRef.Hash())
+
+	p := writeCommit(t, repo, q.TreeHash, []plumbing.Hash{headRef.Hash()}, "2026-04-09T09:00:00Z")
+	target := writeCommit(t, repo, q.TreeHash, []plumbing.Hash{p}, "2026-04-10T09:00:00Z")
+
+	if err := repo.Storer.SetReference(plumbing.NewHashReference(
+		plumbing.NewBranchReferenceName("main"), target,
+	)); err != nil {
+		t.Fatal(err)
+	}
+
+	// p prunes the walk before it ever reaches q, so q's wildly future date
+	// is never read and never rejected.
+	out, code := runCmd(t, dir, target.String())
+	assertEqual(t, 0, code)
+	assertEqual(t, "20260410.1", out)
+}
+
+func TestNearCohortFutureDateErrors(t *testing.T) {
+	t.Parallel()
+	dir, commitAt := testRepo(t)
+	commitAt("2026-04-10T09:00:00Z") // base, same day as the target
+
+	repo, _ := git.PlainOpen(dir)
+	headRef, _ := repo.Head()
+	base, _ := repo.CommitObject(headRef.Hash())
+
+	// skewed is a parent of an already-counted commit, dated *after* it --
+	// clock skew directly adjacent to the cohort, which the pruned walk
+	// must still catch even though it arrives through a second parent.
+	skewed := writeCommit(t, repo, base.TreeHash, nil, "2026-04-11T09:00:00Z")
+	target := writeCommit(t, repo, base.TreeHash, []plumbing.Hash{headRef.Hash(), skewed}, "2026-04-10T10:00:00Z")
+
+	if err := repo.Storer.SetReference(plumbing.NewHashReference(
+		plumbing.NewBranchReferenceName("main"), target,
+	)); err != nil {
+		t.Fatal(err)
+	}
+
+	_, code := runCmd(t, dir, target.String())
 	assertEqual(t, 1, code)
+}
+
+// TestChainD2D2D1D2ForwardOKReverseDecreasing pins a regression: along a
+// first-parent chain dated D2/D2/D1/D2 (newest to oldest), the root is
+// buried behind an older D1 boundary and is oddly dated D2 again -- later
+// than its own child. Forward at the tip must succeed (the pruned walk
+// prunes at the D1 commit and never reaches the buried root), but reverse
+// lookup for D1 walks the unchanged first-parent block-delimiting chain past
+// that same D1 commit to the root and must still die with a decreasing-date
+// error there.
+func TestChainD2D2D1D2ForwardOKReverseDecreasing(t *testing.T) {
+	t.Parallel()
+	dir, commitAt := testRepo(t)
+	commitAt("2026-04-10T06:00:00Z") // root: D2, buried skew (dated after its own child)
+
+	repo, _ := git.PlainOpen(dir)
+	rootRef, _ := repo.Head()
+	root, _ := repo.CommitObject(rootRef.Hash())
+
+	d1 := writeCommit(t, repo, root.TreeHash, []plumbing.Hash{rootRef.Hash()}, "2026-04-09T09:00:00Z") // D1
+	d2 := writeCommit(t, repo, root.TreeHash, []plumbing.Hash{d1}, "2026-04-10T09:00:00Z")             // D2
+	tip := writeCommit(t, repo, root.TreeHash, []plumbing.Hash{d2}, "2026-04-10T10:00:00Z")            // D2
+
+	if err := repo.Storer.SetReference(plumbing.NewHashReference(
+		plumbing.NewBranchReferenceName("main"), tip,
+	)); err != nil {
+		t.Fatal(err)
+	}
+
+	out, code := runCmd(t, dir, tip.String())
+	assertEqual(t, 0, code)
+	assertEqual(t, "20260410.2", out)
+
+	_, code = runCmd(t, dir, "20260409.1")
+	assertEqual(t, 1, code)
+}
+
+func TestRootBlockWholeHistoryOneDate(t *testing.T) {
+	t.Parallel()
+	dir, commitAt := testRepo(t)
+	commitAt("2026-04-10T09:00:00Z") // true root
+
+	repo, _ := git.PlainOpen(dir)
+	headRef, _ := repo.Head()
+	base, _ := repo.CommitObject(headRef.Hash())
+
+	side := writeCommit(t, repo, base.TreeHash, []plumbing.Hash{headRef.Hash()}, "2026-04-10T10:00:00Z")
+	tip := writeCommit(t, repo, base.TreeHash, []plumbing.Hash{headRef.Hash(), side}, "2026-04-10T11:00:00Z")
+
+	if err := repo.Storer.SetReference(plumbing.NewHashReference(
+		plumbing.NewBranchReferenceName("main"), tip,
+	)); err != nil {
+		t.Fatal(err)
+	}
+
+	// Every commit in the repository shares one date, including the true
+	// root (zero recorded parents); the whole history is one cohort.
+	out, code := runCmd(t, dir, tip.String())
+	assertEqual(t, 0, code)
+	assertEqual(t, "20260410.3", out)
+
+	out, code = runCmd(t, dir, "20260410.3")
+	assertEqual(t, 0, code)
+	assertEqual(t, tip.String(), out)
+}
+
+// shallowSetter marks specific commits as shallow boundaries directly,
+// giving tests exact control over where the boundary falls independent of
+// git's real depth-based shallow-clone algorithm.
+type shallowSetter interface {
+	SetShallow(commits []plumbing.Hash) error
+}
+
+func setShallow(t *testing.T, repo *git.Repository, hashes ...plumbing.Hash) {
+	t.Helper()
+	setter, ok := repo.Storer.(shallowSetter)
+	if !ok {
+		t.Fatal("storer does not support SetShallow")
+	}
+	if err := setter.SetShallow(hashes); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestShallowSecondParentSameDateExitsIncomplete(t *testing.T) {
+	t.Parallel()
+	dir, commitAt := testRepo(t)
+	commitAt("2026-04-08T09:00:00Z") // r: older root
+
+	repo, _ := git.PlainOpen(dir)
+	rRef, _ := repo.Head()
+	r, _ := repo.CommitObject(rRef.Hash())
+
+	// f0 is same-date as the merge and reached only through the second
+	// parent; it is the shallow boundary, so its own parent r is
+	// unresolvable for completeness purposes even though r is physically
+	// present in this repository.
+	f0 := writeCommit(t, repo, r.TreeHash, []plumbing.Hash{rRef.Hash()}, "2026-04-10T09:00:00Z")
+	m1 := writeCommit(t, repo, r.TreeHash, []plumbing.Hash{rRef.Hash()}, "2026-04-10T10:00:00Z")
+	merge := writeCommit(t, repo, r.TreeHash, []plumbing.Hash{m1, f0}, "2026-04-10T11:00:00Z")
+
+	if err := repo.Storer.SetReference(plumbing.NewHashReference(
+		plumbing.NewBranchReferenceName("main"), merge,
+	)); err != nil {
+		t.Fatal(err)
+	}
+	setShallow(t, repo, f0)
+
+	out, code := runCmd(t, dir, merge.String())
+	assertEqual(t, 4, code)
+	if !strings.Contains(out, "history") {
+		t.Fatalf("expected incomplete-history error, got %q", out)
+	}
+}
+
+func TestReverseShallowSecondParentSameDateExitsIncomplete(t *testing.T) {
+	t.Parallel()
+	dir, commitAt := testRepo(t)
+	commitAt("2026-04-08T09:00:00Z") // r: older root
+
+	repo, _ := git.PlainOpen(dir)
+	rRef, _ := repo.Head()
+	r, _ := repo.CommitObject(rRef.Hash())
+
+	f0 := writeCommit(t, repo, r.TreeHash, []plumbing.Hash{rRef.Hash()}, "2026-04-10T09:00:00Z")
+	m1 := writeCommit(t, repo, r.TreeHash, []plumbing.Hash{rRef.Hash()}, "2026-04-10T10:00:00Z")
+	merge := writeCommit(t, repo, r.TreeHash, []plumbing.Hash{m1, f0}, "2026-04-10T11:00:00Z")
+
+	if err := repo.Storer.SetReference(plumbing.NewHashReference(
+		plumbing.NewBranchReferenceName("main"), merge,
+	)); err != nil {
+		t.Fatal(err)
+	}
+	setShallow(t, repo, f0)
+
+	// The first-parent block-delimiting walk (merge -> m1 -> r) never
+	// touches f0, so it succeeds; m1's own cohort is {m1} = 1. Only once
+	// selection reaches merge's own cohort does f0's shallow boundary
+	// surface, turning a would-be "not found" into "incomplete history".
+	out, code := runCmd(t, dir, "20260410.2")
+	assertEqual(t, 4, code)
+	if !strings.Contains(out, "history") {
+		t.Fatalf("expected incomplete-history error, got %q", out)
+	}
+}
+
+func TestShallowOlderDatedBoundaryOK(t *testing.T) {
+	t.Parallel()
+	dir, commitAt := testRepo(t)
+	commitAt("2026-04-08T09:00:00Z") // r: ancient root
+
+	repo, _ := git.PlainOpen(dir)
+	rRef, _ := repo.Head()
+	r, _ := repo.CommitObject(rRef.Hash())
+
+	// old is dated before the target and is a shallow boundary; since it is
+	// strictly older, the walk prunes it without ever needing its own
+	// parents, so the boundary is harmless.
+	old := writeCommit(t, repo, r.TreeHash, []plumbing.Hash{rRef.Hash()}, "2026-04-09T09:00:00Z")
+	target := writeCommit(t, repo, r.TreeHash, []plumbing.Hash{old}, "2026-04-10T09:00:00Z")
+
+	if err := repo.Storer.SetReference(plumbing.NewHashReference(
+		plumbing.NewBranchReferenceName("main"), target,
+	)); err != nil {
+		t.Fatal(err)
+	}
+	setShallow(t, repo, old)
+
+	out, code := runCmd(t, dir, target.String())
+	assertEqual(t, 0, code)
+	assertEqual(t, "20260410.1", out)
+}
+
+func TestShallowMarkedTrueRootSameDateOK(t *testing.T) {
+	t.Parallel()
+	dir, commitAt := testRepo(t)
+	commitAt("2026-04-10T09:00:00Z") // root, same date as the target
+
+	repo, _ := git.PlainOpen(dir)
+	rootRef, _ := repo.Head()
+	root, _ := repo.CommitObject(rootRef.Hash())
+	target := writeCommit(t, repo, root.TreeHash, []plumbing.Hash{rootRef.Hash()}, "2026-04-10T10:00:00Z")
+	if err := repo.Storer.SetReference(plumbing.NewHashReference(
+		plumbing.NewBranchReferenceName("main"), target,
+	)); err != nil {
+		t.Fatal(err)
+	}
+
+	// Real depth-limited clones list depth-cut roots in the shallow file.
+	// A true root hides nothing, so a same-date root carrying a shallow
+	// mark must still be countable, not exit 4.
+	setShallow(t, repo, rootRef.Hash())
+
+	out, code := runCmd(t, dir, target.String())
+	assertEqual(t, 0, code)
+	assertEqual(t, "20260410.2", out)
+}
+
+func TestReverseShallowCloneIncomplete(t *testing.T) {
+	t.Parallel()
+	remoteDir, commitAt := testRepo(t)
+	commitAt("2026-04-10T09:00:00Z")
+	commitAt("2026-04-10T10:00:00Z")
+
+	localDir := t.TempDir()
+	if _, err := git.PlainClone(localDir, false, &git.CloneOptions{
+		URL:   remoteDir,
+		Depth: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	out, code := runCmd(t, localDir, "20260410.1")
+	assertEqual(t, 4, code)
+	if !strings.Contains(out, "history") {
+		t.Fatalf("expected incomplete-history error, got %q", out)
+	}
 }
 
 // --- UTC midnight boundary ---
