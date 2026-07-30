@@ -19,6 +19,7 @@ import (
 	"github.com/go-git/go-git/v5/config"
 	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/go-git/go-git/v5/plumbing/cache"
+	"github.com/go-git/go-git/v5/plumbing/object"
 	"github.com/go-git/go-git/v5/storage"
 	"github.com/go-git/go-git/v5/storage/filesystem"
 	"github.com/go-git/go-git/v5/storage/filesystem/dotgit"
@@ -271,7 +272,7 @@ func forward(state *repoState, opts *Options) (string, error) {
 		return "", &ExitError{exitDirty, "workspace is dirty; use --dirty to allow"}
 	}
 
-	date, count, err := walkFirstParent(state.history, anchor)
+	date, count, err := cohortCount(state.history, anchor)
 	if err != nil {
 		return "", err
 	}
@@ -287,38 +288,52 @@ func forward(state *repoState, opts *Options) (string, error) {
 	return formatVersion(opts.Prefix, date, count, dirtyStr, hash), nil
 }
 
-func walkFirstParent(history *history, startHash plumbing.Hash) (string, int, error) {
-	commit, err := history.commit(startHash)
+// cohortCount computes a commit's version date and N: the size of its date
+// cohort, the set of commits reachable from it through any parent whose UTC
+// committer date equals its own. It is a pruned BFS over all parents: a
+// same-date parent is counted and traversed; a strictly older parent is
+// counted as a boundary and not traversed past; a strictly newer parent
+// means committer dates are not monotonic, which is rejected outright. Every
+// commit visited by the walk shares startHash's date, so a parent's
+// classification cannot depend on which cohort member discovered it first.
+func cohortCount(history *history, startHash plumbing.Hash) (string, int, error) {
+	target, err := history.commit(startHash)
 	if err != nil {
 		return "", 0, &ExitError{exitIncompleteHistory, "local history ended inside the target date block"}
 	}
 
-	date := commit.Committer.When.UTC().Format(dateFormat)
-	count := 1
+	date := target.Committer.When.UTC().Format(dateFormat)
+	visited := map[plumbing.Hash]struct{}{startHash: {}}
+	cohort := []*object.Commit{target}
 
-	for {
-		parent, ok, parentErr := history.firstParent(commit)
-		if parentErr != nil {
+	for i := 0; i < len(cohort); i++ {
+		parents, parentsErr := history.parents(cohort[i])
+		if parentsErr != nil {
 			return "", 0, &ExitError{
 				exitIncompleteHistory,
 				"local history ended inside the " + date + " date block",
 			}
 		}
-		if !ok {
-			return date, count, nil
-		}
-
-		parentDate := parent.Committer.When.UTC().Format(dateFormat)
-		if parentDate != date {
-			if parentDate > date {
-				return "", 0, dateWentBackwards(parentDate, date)
+		for _, parent := range parents {
+			if _, seen := visited[parent.Hash]; seen {
+				continue
 			}
-			return date, count, nil
-		}
+			visited[parent.Hash] = struct{}{}
 
-		count++
-		commit = parent
+			parentDate := parent.Committer.When.UTC().Format(dateFormat)
+			switch {
+			case parentDate == date:
+				cohort = append(cohort, parent)
+			case parentDate > date:
+				return "", 0, dateWentBackwards(parentDate, date)
+			default:
+				// Strictly older: a boundary. Not counted, not traversed
+				// past.
+			}
+		}
 	}
+
+	return date, len(cohort), nil
 }
 
 func reverse(state *repoState, opts *Options, lookup string) (string, error) {
@@ -376,7 +391,7 @@ func reverse(state *repoState, opts *Options, lookup string) (string, error) {
 		commit = parent
 	}
 
-	targetHash, err := selectReverseCandidate(candidates, n, opts.Target)
+	targetHash, err := selectReverseCandidate(state.history, candidates, n, opts.Target)
 	if err != nil {
 		return "", err
 	}
@@ -386,15 +401,31 @@ func reverse(state *repoState, opts *Options, lookup string) (string, error) {
 	return targetHash.String(), nil
 }
 
+// selectReverseCandidate finds the date-block member whose date cohort has
+// exactly n commits. candidates is newest-first, as collected by the
+// first-parent block walk; cohort size strictly increases oldest-to-newest
+// within a block, so this checks oldest-to-newest and stops as soon as the
+// cohort size reaches or passes n. Sequences are sparse under the 0.3
+// counting rule, so a miss is "not found" — never the nearest match.
 func selectReverseCandidate(
-	candidates []plumbing.Hash, n int, version string,
+	history *history, candidates []plumbing.Hash, n int, version string,
 ) (plumbing.Hash, error) {
-	if n > len(candidates) {
-		return plumbing.ZeroHash, &ExitError{exitError, "version not found: " + version}
+	notFound := &ExitError{exitError, "version not found: " + version}
+
+	for i := len(candidates) - 1; i >= 0; i-- {
+		_, count, err := cohortCount(history, candidates[i])
+		if err != nil {
+			return plumbing.ZeroHash, err
+		}
+		switch {
+		case count == n:
+			return candidates[i], nil
+		case count > n:
+			return plumbing.ZeroHash, notFound
+		}
 	}
 
-	// N=1 is oldest on that date; candidates are newest-first.
-	return candidates[len(candidates)-n], nil
+	return plumbing.ZeroHash, notFound
 }
 
 func dateWentBackwards(older, newer string) *ExitError {
