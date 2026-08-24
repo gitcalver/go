@@ -2,7 +2,7 @@ module gitcalver.org/go
 
 go 1.25.0
 
-toolchain go1.26.5
+toolchain go1.26.6
 
 require (
 	github.com/go-git/go-billy/v5 v5.8.0
