@@ -23,6 +23,13 @@ Options:
   --short             Output first seven object-ID characters (reverse mode)
   --version           Show version and exit
   --help              Show this help
+
+Exit codes:
+  0   Success
+  1   Invalid input or repository state
+  2   Dirty workspace or off selected branch (without --dirty)
+  3   Complete history proves the target is on an unrelated chain
+  4   Local history is insufficient to prove the result
 `
 
 var buildVersion = "(development)"

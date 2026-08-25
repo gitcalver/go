@@ -1798,17 +1798,32 @@ func TestDetectBranchOverride(t *testing.T) {
 	assertEqual(t, "main", branch.name)
 }
 
-func TestDetectBranchFullRefOverride(t *testing.T) {
+// A full ref path is not a branch name: like the reference implementation,
+// --branch resolves only refs/heads/NAME and refs/remotes/REMOTE/NAME.
+func TestDetectBranchRejectsFullRefOverride(t *testing.T) {
 	t.Parallel()
 	dir, commitAt := testRepo(t)
 	commitAt("2026-04-10T09:00:00Z")
-
 	repo, _ := git.PlainOpen(dir)
-	branch, err := detectBranch(repo, "refs/heads/main")
-	if err != nil {
-		t.Fatal(err)
+
+	for _, tc := range []struct {
+		name     string
+		override string
+	}{
+		{"local", "refs/heads/main"},
+		{"remote", "refs/remotes/origin/main"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			_, err := detectBranch(repo, tc.override)
+			var exitErr *ExitError
+			if !errors.As(err, &exitErr) {
+				t.Fatalf("expected ExitError, got %v", err)
+			}
+			assertEqual(t, exitError, exitErr.Code)
+			assertEqual(t, "branch not found: "+tc.override, exitErr.Error())
+		})
 	}
-	assertEqual(t, "refs/heads/main", branch.name)
 }
 
 func TestDetectBranchEmptyRemote(t *testing.T) {

@@ -5,7 +5,7 @@
 
 COVERAGE_FILE = coverage.out
 CONFORMANCE_DIR ?= ../sh
-CONFORMANCE_SHA := c89d24c9ac36f0672ecfff9727532e344bfa9af9
+CONFORMANCE_SHA := 857287da052d1437703ead1f7d2adc76a95451ba
 
 build:
 	go build -o gitcalver ./cmd/gitcalver

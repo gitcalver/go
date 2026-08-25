@@ -17,6 +17,14 @@ type branchInfo struct {
 
 const defaultRemote = "origin"
 
+func headRefName(name string) string {
+	return "refs/heads/" + name
+}
+
+func remoteRefName(remote, name string) string {
+	return "refs/remotes/" + remote + "/" + name
+}
+
 func detectBranch(repo *git.Repository, override string, remotes ...string) (branchInfo, error) {
 	remote := defaultRemote
 	if len(remotes) > 0 {
@@ -26,11 +34,7 @@ func detectBranch(repo *git.Repository, override string, remotes ...string) (bra
 		return branchInfo{}, &ExitError{exitError, "remote requires a non-empty string"}
 	}
 	if override != "" {
-		if strings.HasPrefix(override, "refs/") {
-			if info, ok := resolveFullRef(repo, override); ok {
-				return info, nil
-			}
-		} else if info, ok := resolveBranch(repo, override, remote); ok {
+		if info, ok := resolveBranch(repo, override, remote); ok {
 			return info, nil
 		}
 		return branchInfo{}, &ExitError{exitError, "branch not found: " + override}
@@ -48,14 +52,14 @@ func detectBranch(repo *git.Repository, override string, remotes ...string) (bra
 	}
 
 	for _, name := range []string{"main", "master"} {
-		if _, found := resolveFullRef(repo, remotePrefix+name); found {
+		if _, found := resolveFullRef(repo, remoteRefName(remote, name)); found {
 			if info, ok := resolveBranch(repo, name, remote); ok {
 				return info, nil
 			}
 		}
 	}
 	for _, name := range []string{"main", "master"} {
-		if info, found := resolveFullRef(repo, "refs/heads/"+name); found {
+		if info, found := resolveFullRef(repo, headRefName(name)); found {
 			info.name = name
 			return info, nil
 		}
@@ -100,8 +104,8 @@ func checkBranchRelation(
 // resolveBranch finds a branch by name, preferring local over the cached remote.
 func resolveBranch(repo *git.Repository, name, remote string) (branchInfo, bool) {
 	for _, refName := range []string{
-		"refs/heads/" + name,
-		"refs/remotes/" + remote + "/" + name,
+		headRefName(name),
+		remoteRefName(remote, name),
 	} {
 		if info, ok := resolveFullRef(repo, refName); ok {
 			info.name = name

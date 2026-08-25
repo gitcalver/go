@@ -294,8 +294,9 @@ func forward(state *repoState, opts *Options) (string, error) {
 // same-date parent is counted and traversed; a strictly older parent is
 // counted as a boundary and not traversed past; a strictly newer parent
 // means committer dates are not monotonic, which is rejected outright. Every
-// commit visited by the walk shares startHash's date, so a parent's
-// classification cannot depend on which cohort member discovered it first.
+// commit the walk traverses shares startHash's date, and a parent is
+// classified by its own date alone, so the classification cannot depend on
+// which cohort member discovered it first.
 func cohortCount(history *history, startHash plumbing.Hash) (string, int, error) {
 	target, err := history.commit(startHash)
 	if err != nil {
@@ -405,8 +406,9 @@ func reverse(state *repoState, opts *Options, lookup string) (string, error) {
 // exactly n commits. candidates is newest-first, as collected by the
 // first-parent block walk; cohort size strictly increases oldest-to-newest
 // within a block, so this checks oldest-to-newest and stops as soon as the
-// cohort size reaches or passes n. Sequences are sparse under the 0.3
-// counting rule, so a miss is "not found" — never the nearest match.
+// cohort size reaches or passes n. Sequences are sparse, because a cohort
+// can grow by more than one through a second parent, so a miss is "not
+// found" — never the nearest match.
 func selectReverseCandidate(
 	history *history, candidates []plumbing.Hash, n int, version string,
 ) (plumbing.Hash, error) {
