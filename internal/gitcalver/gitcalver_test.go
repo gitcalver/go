@@ -559,6 +559,31 @@ func TestRepositoryOpenDetection(t *testing.T) {
 		assertEqual(t, 1, code)
 		assertEqual(t, "gitcalver: not a git repository", out)
 	})
+	for _, tc := range []struct {
+		name  string
+		files map[string]string
+	}{
+		{"unparseable config", map[string]string{"HEAD": "ref: refs/heads/main\n", "config": "key: value\n"}},
+		{"missing common directory", map[string]string{"commondir": "/nonexistent\n"}},
+	} {
+		t.Run("subdirectory with "+tc.name, func(t *testing.T) {
+			t.Parallel()
+			dir, commitAt := testRepo(t)
+			commitAt("2026-04-10T09:00:00Z")
+			sub := filepath.Join(dir, "sub")
+			if err := os.Mkdir(sub, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			for name, content := range tc.files {
+				if err := os.WriteFile(filepath.Join(sub, name), []byte(content), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			out, code := runCmd(t, sub, "HEAD")
+			assertEqual(t, 0, code)
+			assertEqual(t, "20260410.1", out)
+		})
+	}
 }
 
 func TestBranchDetectionFails(t *testing.T) {

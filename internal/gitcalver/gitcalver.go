@@ -112,7 +112,7 @@ func validateRepo(dir string) (*repoState, error) {
 	repo, err := openRepository(dir, false)
 	// Search upward only when dir is not itself a repository: the search matches
 	// .git entries, so it passes over a bare repository and opens its enclosing one.
-	if errors.Is(err, git.ErrRepositoryNotExists) {
+	if err != nil && !dirs.atRoot {
 		repo, err = openRepository(dir, true)
 	}
 	if errors.Is(err, git.ErrSHA256NotSupported) {
@@ -463,6 +463,7 @@ type gitDirectories struct {
 	commonDir   string
 	worktreeDir string
 	bare        bool
+	atRoot      bool // the searched directory is the repository root, not a subdirectory of it
 }
 
 func findGitDirs(dir string) (gitDirectories, error) {
@@ -495,6 +496,7 @@ func findGitDirs(dir string) (gitDirectories, error) {
 				commonDir:   commonDir,
 				worktreeDir: current,
 				bare:        bare,
+				atRoot:      current == start,
 			}, nil
 		}
 		parent := filepath.Dir(current)
