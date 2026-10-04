@@ -466,16 +466,8 @@ func TestSHA256RepositoryRejected(t *testing.T) {
 	gitCLI(t, "init", "--object-format=sha256", partial)
 	enablePartialClone(t, filepath.Join(partial, ".git", "config"))
 
-	for _, tc := range []struct {
-		name string
-		dir  string
-	}{
-		{"worktree", dir},
-		{"nested", nested},
-		{"linked worktree", linked},
-		{"bare", bare},
-		{"partial clone", partial},
-	} {
+	layouts := repoLayouts{worktree: dir, nested: nested, linked: linked, bare: bare, partial: partial}
+	for _, tc := range layouts.all() {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			for _, args := range [][]string{nil, {"HEAD"}, {"20260410.1"}} {
@@ -487,14 +479,58 @@ func TestSHA256RepositoryRejected(t *testing.T) {
 	}
 }
 
-func TestUnrecognizedObjectFormatIsNotSHA256(t *testing.T) {
+func TestExplicitSHA1RepositoryAccepted(t *testing.T) {
 	t.Parallel()
-	for _, format := range []string{"SHA1", "sha512"} {
-		t.Run(format, func(t *testing.T) {
+	dir, commitAt := testRepo(t)
+	commitAt("2026-04-10T09:00:00Z")
+	commitAt("2026-04-10T10:00:00Z")
+	nested := filepath.Join(dir, "nested")
+	if err := os.Mkdir(nested, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	linked := filepath.Join(t.TempDir(), "linked")
+	gitCLI(t, "-C", dir, "worktree", "add", "--detach", linked, "HEAD")
+	bare := filepath.Join(t.TempDir(), "bare.git")
+	gitCLI(t, "clone", "--bare", dir, bare)
+	partial := filepath.Join(t.TempDir(), "partial")
+	gitCLI(t, "clone", dir, partial)
+	for _, configPath := range []string{
+		filepath.Join(dir, ".git", "config"),
+		filepath.Join(bare, "config"),
+		filepath.Join(partial, ".git", "config"),
+	} {
+		setObjectFormat(t, configPath, "1", "sha1")
+	}
+	enablePartialClone(t, filepath.Join(partial, ".git", "config"))
+
+	layouts := repoLayouts{worktree: dir, nested: nested, linked: linked, bare: bare, partial: partial}
+	for _, tc := range layouts.all() {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			for _, args := range [][]string{nil, {"HEAD"}} {
+				out, code := runCmd(t, tc.dir, args...)
+				assertEqual(t, 0, code)
+				assertEqual(t, "20260410.2", out)
+			}
+		})
+	}
+}
+
+func TestRejectedObjectFormatIsNotSHA256(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct{ name, version, format string }{
+		{"version 0 sha1", "0", "sha1"},
+		{"version 2 sha1", "2", "sha1"},
+		{"no version sha1", "", "sha1"},
+		{"version 1 SHA1", "1", "SHA1"},
+		{"version 1 SHA256", "1", "SHA256"},
+		{"version 1 sha512", "1", "sha512"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			dir, commitAt := testRepo(t)
 			commitAt("2026-04-10T09:00:00Z")
-			gitCLI(t, "-C", dir, "config", "extensions.objectformat", format)
+			setObjectFormat(t, filepath.Join(dir, ".git", "config"), tc.version, tc.format)
 
 			out, code := runCmd(t, dir)
 			assertEqual(t, 1, code)
@@ -543,18 +579,8 @@ func TestRepositoryOpenDetection(t *testing.T) {
 		dir, commitAt := testRepo(t)
 		commitAt("2026-04-10T09:00:00Z")
 		bare := filepath.Join(dir, "nested.git")
-		if _, err := git.PlainInit(bare, true); err != nil {
-			t.Fatal(err)
-		}
-		configPath := filepath.Join(bare, "config")
-		data, err := os.ReadFile(configPath)
-		if err != nil {
-			t.Fatal(err)
-		}
-		data = append(data, []byte("[extensions]\n\tunsupported = true\n")...)
-		if err = os.WriteFile(configPath, data, 0o644); err != nil {
-			t.Fatal(err)
-		}
+		gitCLI(t, "init", "--bare", bare)
+		gitCLI(t, "-C", bare, "config", "extensions.unsupported", "true")
 		out, code := runCmd(t, bare, "HEAD")
 		assertEqual(t, 1, code)
 		assertEqual(t, "gitcalver: not a git repository", out)
@@ -2833,14 +2859,48 @@ func writeCommit(
 
 // gitCLI runs git without the caller's environment: GIT_* variables inherited
 // from a hook point git at another repository, and global configuration such
-// as hooks changes what fixture commands do.
+// as hooks changes what fixture commands do. It creates SHA-1 repositories with
+// the files ref format, the only formats go-git reads, unless told otherwise.
 func gitCLI(t *testing.T, args ...string) {
 	t.Helper()
 	cmd := exec.Command("git", args...)
 	cmd.Env = slices.DeleteFunc(os.Environ(), func(kv string) bool { return strings.HasPrefix(kv, "GIT_") })
-	cmd.Env = append(cmd.Env, "GIT_CONFIG_GLOBAL="+os.DevNull, "GIT_CONFIG_NOSYSTEM=1")
+	cmd.Env = append(cmd.Env,
+		"GIT_CONFIG_GLOBAL="+os.DevNull,
+		"GIT_CONFIG_NOSYSTEM=1",
+		"GIT_DEFAULT_HASH=sha1",
+		"GIT_DEFAULT_REF_FORMAT=files",
+	)
 	if output, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("git %v: %v: %s", args, err, output)
+	}
+}
+
+// setObjectFormat writes through --file: git refuses to run inside a
+// repository with some of these version and format combinations.
+func setObjectFormat(t *testing.T, configPath, version, format string) {
+	t.Helper()
+	gitCLI(t, "config", "--file", configPath, "extensions.objectformat", format)
+	if version != "" {
+		gitCLI(t, "config", "--file", configPath, "core.repositoryformatversion", version)
+	}
+}
+
+type repoLayouts struct {
+	worktree, nested, linked, bare, partial string
+}
+
+type repoLayout struct {
+	name, dir string
+}
+
+func (l repoLayouts) all() []repoLayout {
+	return []repoLayout{
+		{"worktree", l.worktree},
+		{"nested", l.nested},
+		{"linked worktree", l.linked},
+		{"bare", l.bare},
+		{"partial clone", l.partial},
 	}
 }
 

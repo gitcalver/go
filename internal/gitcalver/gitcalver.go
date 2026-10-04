@@ -19,6 +19,7 @@ import (
 	"github.com/go-git/go-git/v5/config"
 	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/go-git/go-git/v5/plumbing/cache"
+	cfgformat "github.com/go-git/go-git/v5/plumbing/format/config"
 	"github.com/go-git/go-git/v5/plumbing/object"
 	"github.com/go-git/go-git/v5/storage"
 	"github.com/go-git/go-git/v5/storage/filesystem"
@@ -174,17 +175,27 @@ func (s *partialCloneStorer) Config() (*config.Config, error) {
 	if err != nil {
 		return nil, err
 	}
-	if cfg.Raw != nil && cfg.Raw.HasSection("extensions") {
-		extensions := cfg.Raw.Section("extensions")
-		// go-git v5 leaves cfg.Extensions.ObjectFormat empty when reading a config,
-		// so the raw option is the only place the object format appears.
-		if extensions.Option("objectformat") == "sha256" {
-			return nil, git.ErrSHA256NotSupported
-		}
-		// Filesystem storage reads a fresh Config value on every call. Removing
-		// this one extension only from that in-memory value lets go-git inspect the
-		// already-local object database without altering the repository or fetching.
-		extensions.RemoveOption("partialClone")
+	if cfg.Raw == nil || !cfg.Raw.HasSection("extensions") {
+		return cfg, nil
+	}
+
+	// go-git v5 leaves cfg.Extensions.ObjectFormat empty when reading a config,
+	// so the raw options are the only place the object format appears.
+	extensions := cfg.Raw.Section("extensions")
+	format := cfgformat.ObjectFormat(extensions.Option("objectformat"))
+	if format == cfgformat.SHA256 {
+		return nil, git.ErrSHA256NotSupported
+	}
+	// Filesystem storage reads a fresh Config value on every call. Removing
+	// extensions only from that in-memory value lets go-git inspect the
+	// already-local object database without altering the repository or fetching.
+	extensions.RemoveOption("partialClone")
+	// go-git rejects every objectformat extension, though sha1 is the format it
+	// reads. Git honors the extension only at repository format version 1 and
+	// rejects it at version 0.
+	if format == cfgformat.SHA1 &&
+		cfg.Raw.Section("core").Option("repositoryformatversion") == cfgformat.Version_1 {
+		extensions.RemoveOption("objectformat")
 	}
 	return cfg, nil
 }
