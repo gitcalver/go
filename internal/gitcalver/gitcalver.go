@@ -110,8 +110,13 @@ func validateRepo(dir string) (*repoState, error) {
 	}
 
 	repo, err := openRepository(dir, false)
-	if err != nil {
+	// Search upward only when dir is not itself a repository: the search matches
+	// .git entries, so it passes over a bare repository and opens its enclosing one.
+	if errors.Is(err, git.ErrRepositoryNotExists) {
 		repo, err = openRepository(dir, true)
+	}
+	if errors.Is(err, git.ErrSHA256NotSupported) {
+		return nil, &ExitError{exitError, "SHA-256 repositories are not supported"}
 	}
 	if err != nil {
 		return nil, &ExitError{exitError, "not a git repository"}
@@ -169,11 +174,17 @@ func (s *partialCloneStorer) Config() (*config.Config, error) {
 	if err != nil {
 		return nil, err
 	}
-	// Filesystem storage reads a fresh Config value on every call. Removing
-	// this one extension only from that in-memory value lets go-git inspect the
-	// already-local object database without altering the repository or fetching.
 	if cfg.Raw != nil && cfg.Raw.HasSection("extensions") {
-		cfg.Raw.Section("extensions").RemoveOption("partialClone")
+		extensions := cfg.Raw.Section("extensions")
+		// go-git v5 leaves cfg.Extensions.ObjectFormat empty when reading a config,
+		// so the raw option is the only place the object format appears.
+		if extensions.Option("objectformat") == "sha256" {
+			return nil, git.ErrSHA256NotSupported
+		}
+		// Filesystem storage reads a fresh Config value on every call. Removing
+		// this one extension only from that in-memory value lets go-git inspect the
+		// already-local object database without altering the repository or fetching.
+		extensions.RemoveOption("partialClone")
 	}
 	return cfg, nil
 }

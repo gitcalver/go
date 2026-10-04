@@ -16,12 +16,13 @@ test:
 	  END{printf "Coverage: %.1f%%\n",(t>0?100*c/t:0); \
 	  if(c!=t){print "FAIL: coverage is not 100.0%";exit 1}}' $(COVERAGE_FILE)
 
+# GIT_DEFAULT_HASH pins the fixtures to SHA-1, the only object format gitcalver reads.
 test-conformance: build
 	@test "$$(git -C "$(CONFORMANCE_DIR)" rev-parse "$(CONFORMANCE_SHA)^{commit}")" = "$(CONFORMANCE_SHA)"
 	@tmp="$$(mktemp)"; \
 	trap 'rm -f "$$tmp"' EXIT HUP INT TERM; \
 	git -C "$(CONFORMANCE_DIR)" show "$(CONFORMANCE_SHA):test/test.sh" >"$$tmp"; \
-	GITCALVER="$(CURDIR)/gitcalver" sh "$$tmp"
+	GIT_DEFAULT_HASH=sha1 GITCALVER="$(CURDIR)/gitcalver" sh "$$tmp"
 
 lint:
 	go tool golangci-lint run

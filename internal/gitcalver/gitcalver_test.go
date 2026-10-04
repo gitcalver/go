@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -449,6 +450,59 @@ func TestNotARepo(t *testing.T) {
 	assertEqual(t, 1, code)
 }
 
+func TestSHA256RepositoryRejected(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	gitCLI(t, "init", "--object-format=sha256", dir)
+	nested := filepath.Join(dir, "nested")
+	if err := os.Mkdir(nested, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	linked := filepath.Join(t.TempDir(), "linked")
+	gitCLI(t, "-C", dir, "worktree", "add", "--orphan", "-b", "linked", linked)
+	bare := filepath.Join(t.TempDir(), "bare.git")
+	gitCLI(t, "init", "--bare", "--object-format=sha256", bare)
+	partial := t.TempDir()
+	gitCLI(t, "init", "--object-format=sha256", partial)
+	enablePartialClone(t, filepath.Join(partial, ".git", "config"))
+
+	for _, tc := range []struct {
+		name string
+		dir  string
+	}{
+		{"worktree", dir},
+		{"nested", nested},
+		{"linked worktree", linked},
+		{"bare", bare},
+		{"partial clone", partial},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			for _, args := range [][]string{nil, {"HEAD"}, {"20260410.1"}} {
+				out, code := runCmd(t, tc.dir, args...)
+				assertEqual(t, 1, code)
+				assertEqual(t, "gitcalver: SHA-256 repositories are not supported", out)
+			}
+		})
+	}
+}
+
+func TestUnrecognizedObjectFormatIsNotSHA256(t *testing.T) {
+	t.Parallel()
+	for _, format := range []string{"SHA1", "sha512"} {
+		t.Run(format, func(t *testing.T) {
+			t.Parallel()
+			dir, commitAt := testRepo(t)
+			commitAt("2026-04-10T09:00:00Z")
+			gitCLI(t, "-C", dir, "config", "extensions.objectformat", format)
+
+			out, code := runCmd(t, dir)
+			assertEqual(t, 1, code)
+			assertEqual(t, "gitcalver: not a git repository", out)
+		})
+	}
+}
+
 func TestEmptyRepo(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
@@ -483,6 +537,27 @@ func TestRepositoryOpenDetection(t *testing.T) {
 		}
 		_, code := runCmd(t, dir)
 		assertEqual(t, 1, code)
+	})
+	t.Run("unsupported bare repository inside another repository", func(t *testing.T) {
+		t.Parallel()
+		dir, commitAt := testRepo(t)
+		commitAt("2026-04-10T09:00:00Z")
+		bare := filepath.Join(dir, "nested.git")
+		if _, err := git.PlainInit(bare, true); err != nil {
+			t.Fatal(err)
+		}
+		configPath := filepath.Join(bare, "config")
+		data, err := os.ReadFile(configPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		data = append(data, []byte("[extensions]\n\tunsupported = true\n")...)
+		if err = os.WriteFile(configPath, data, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		out, code := runCmd(t, bare, "HEAD")
+		assertEqual(t, 1, code)
+		assertEqual(t, "gitcalver: not a git repository", out)
 	})
 }
 
@@ -2250,10 +2325,7 @@ func TestPartialCloneLinkedWorktreeStorage(t *testing.T) {
 	dir, commitAt := testRepo(t)
 	commitAt("2026-04-10T09:00:00Z")
 	linked := filepath.Join(t.TempDir(), "linked")
-	cmd := exec.Command("git", "-C", dir, "worktree", "add", "--detach", linked, "HEAD")
-	if output, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("git worktree add: %v: %s", err, output)
-	}
+	gitCLI(t, "-C", dir, "worktree", "add", "--detach", linked, "HEAD")
 
 	repo, err := openRepositoryIgnoringPartialClone(linked)
 	if err != nil {
@@ -2732,6 +2804,19 @@ func writeCommit(
 		t.Fatal(err)
 	}
 	return hash
+}
+
+// gitCLI runs git without the caller's environment: GIT_* variables inherited
+// from a hook point git at another repository, and global configuration such
+// as hooks changes what fixture commands do.
+func gitCLI(t *testing.T, args ...string) {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Env = slices.DeleteFunc(os.Environ(), func(kv string) bool { return strings.HasPrefix(kv, "GIT_") })
+	cmd.Env = append(cmd.Env, "GIT_CONFIG_GLOBAL="+os.DevNull, "GIT_CONFIG_NOSYSTEM=1")
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git %v: %v: %s", args, err, output)
+	}
 }
 
 func enablePartialClone(t *testing.T, configPath string) {

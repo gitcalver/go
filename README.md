@@ -119,3 +119,8 @@ local commit objects prove the selected first-parent relationship, anchor, and
 the target's complete date cohort — every same-date commit reachable through
 any parent, not just the first-parent chain. Missing promised commits return
 exit code 4; GitCalVer never fetches them during calculation.
+
+## SHA-256 support
+
+SHA-256 repositories are rejected with exit code 1 because `go-git` v5 cannot
+open them ([go-git#706](https://github.com/go-git/go-git/issues/706)).
