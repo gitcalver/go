@@ -5,8 +5,10 @@
 package gitcalver
 
 import (
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -14,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/go-git/go-billy/v5"
 	"github.com/go-git/go-billy/v5/osfs"
 	git "github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/config"
@@ -33,11 +36,33 @@ const (
 	exitIncompleteHistory = 4
 
 	dateFormat = "20060102"
+
+	// hexObjectIDLength is the length of a SHA-1 object ID in hex. A longer
+	// SHA-256 ID starts with as many hex digits.
+	hexObjectIDLength = 40
+
+	// headReadLimit is how much of HEAD git reads when it tests for a git
+	// directory.
+	headReadLimit = 255
 )
 
 var versionRe = regexp.MustCompile(`^(\d{8})\.([1-9]\d*)$`)
 
-var errInvalidGitFile = errors.New("invalid .git file")
+var (
+	errInvalidGitFile = errors.New("invalid .git file")
+	errEmptyCommonDir = errors.New("empty commondir file")
+)
+
+var errBadBool = errors.New("bad boolean config value")
+
+// gitIntRe is the integer grammar of strtoimax with base 0, which git applies
+// to a boolean that is not a word: white space, a sign, a hexadecimal, octal,
+// or decimal number, and a unit.
+var gitIntRe = regexp.MustCompile(`^[ \t-\r]*([+-]?(?:0[xX][0-9a-fA-F]+|0[0-7]*|[1-9][0-9]*))([kKmMgG]?)$`)
+
+// gitIntBits is how many bits a number may have before its unit multiplies it
+// by 1<<10, 1<<20, or 1<<30 into a C int.
+var gitIntBits = map[string]int{"": 32, "k": 22, "m": 12, "g": 2}
 
 // Options configures a gitcalver invocation.
 type Options struct {
@@ -64,10 +89,11 @@ func (e *ExitError) Error() string {
 }
 
 type repoState struct {
-	repo     *git.Repository
-	history  *history
-	headHash plumbing.Hash
-	worktree *git.Worktree
+	repo      *git.Repository
+	history   *history
+	headHash  plumbing.Hash
+	worktree  *git.Worktree
+	workspace workspaceKind
 }
 
 // Run executes gitcalver and returns the output string.
@@ -110,12 +136,7 @@ func validateRepo(dir string) (*repoState, error) {
 		return nil, &ExitError{exitError, "not a git repository"}
 	}
 
-	repo, err := openRepository(dir, false)
-	// Search upward only when dir is not itself a repository: the search matches
-	// .git entries, so it passes over a bare repository and opens its enclosing one.
-	if err != nil && !dirs.atRoot {
-		repo, err = openRepository(dir, true)
-	}
+	repo, workspace, err := openRepository(dirs)
 	if errors.Is(err, git.ErrSHA256NotSupported) {
 		return nil, &ExitError{exitError, "SHA-256 repositories are not supported"}
 	}
@@ -147,31 +168,38 @@ func validateRepo(dir string) (*repoState, error) {
 	worktree, _ := repo.Worktree() //nolint:errcheck // nil worktree is the expected bare-repository result
 
 	return &repoState{
-		repo:     repo,
-		history:  h,
-		headHash: headRef.Hash(),
-		worktree: worktree,
+		repo:      repo,
+		history:   h,
+		headHash:  headRef.Hash(),
+		worktree:  worktree,
+		workspace: workspace,
 	}, nil
 }
 
-func openRepository(dir string, detect bool) (*git.Repository, error) {
-	repo, err := git.PlainOpenWithOptions(dir, &git.PlainOpenOptions{
-		DetectDotGit:          detect,
-		EnableDotGitCommonDir: true,
-	})
-	if err == nil || (!errors.Is(err, git.ErrUnknownExtension) &&
-		!errors.Is(err, git.ErrUnsupportedExtensionRepositoryFormatVersion)) {
-		return repo, err
+// compatStorage presents a repository to go-git v5 as one it can open: git
+// accepts configurations go-git rejects, such as partial clones and an explicit
+// sha1 object format, while SHA-256 repositories need a clear refusal.
+// Embedding *filesystem.Storage keeps the optional methods go-git finds by type
+// assertion, such as HashesWithPrefix, which makes short-hash lookup fast.
+type compatStorage struct {
+	*filesystem.Storage
+}
+
+func newCompatStorage(fs billy.Filesystem) *compatStorage {
+	return &compatStorage{filesystem.NewStorage(fs, cache.NewObjectLRUDefault())}
+}
+
+// Module gives submodules the same treatment as the superproject.
+func (s *compatStorage) Module(name string) (storage.Storer, error) {
+	moduleFS, err := dotgit.New(s.Filesystem()).Module(name)
+	if err != nil {
+		return nil, err
 	}
-	return openRepositoryIgnoringPartialClone(dir)
+	return newCompatStorage(moduleFS), nil
 }
 
-type partialCloneStorer struct {
-	storage.Storer
-}
-
-func (s *partialCloneStorer) Config() (*config.Config, error) {
-	cfg, err := s.Storer.Config()
+func (s *compatStorage) Config() (*config.Config, error) {
+	cfg, err := s.Storage.Config()
 	if err != nil {
 		return nil, err
 	}
@@ -200,24 +228,91 @@ func (s *partialCloneStorer) Config() (*config.Config, error) {
 	return cfg, nil
 }
 
-func openRepositoryIgnoringPartialClone(dir string) (*git.Repository, error) {
-	dirs, err := findGitDirs(dir)
-	if err != nil {
-		return nil, err
-	}
+type workspaceKind int
 
-	dotGitFS := osfs.New(dirs.gitDir)
-	repoFS := dotGitFS
+const (
+	workspaceNone        workspaceKind = iota // bare repository
+	workspaceHere                             // working tree at gitDirectories.worktreeDir
+	workspaceUnreachable                      // working tree exists but not from the search directory
+)
+
+// workspaceOf follows git's own rules. A repository found through a .git entry
+// is bare only when its own config says core.bare is true, which linked
+// worktrees (no config of their own) never do. Git reads that setting through
+// a .git entry only from a config that has a repositoryformatversion. A
+// repository found as the git directory itself is bare unless core.bare is
+// explicitly false, in which case its working tree is out of reach.
+func workspaceOf(dirs gitDirectories, cfg *config.Config) (workspaceKind, error) {
+	core := cfg.Raw.Section("core")
+	// Git rejects a malformed core.bare even when a later setting overrides it.
+	settings := core.OptionAll("bare")
+	isBare := false
+	for _, setting := range settings {
+		var err error
+		if isBare, err = gitBool(setting); err != nil {
+			return workspaceNone, fmt.Errorf("core.bare: %w", err)
+		}
+	}
+	if dirs.inGitDir {
+		if isBare || len(settings) == 0 {
+			return workspaceNone, nil
+		}
+		return workspaceUnreachable, nil
+	}
+	if isBare && dirs.gitDir == dirs.commonDir && core.HasOption("repositoryformatversion") {
+		return workspaceNone, nil
+	}
+	return workspaceHere, nil
+}
+
+// gitBool reads a boolean as git_config_bool does. Words are true or false in
+// any case. Any other value must be an integer that fits a C int after its
+// unit scales it, and is true unless it is zero.
+func gitBool(value string) (bool, error) {
+	switch strings.ToLower(value) {
+	case "true", "yes", "on":
+		return true, nil
+	case "false", "no", "off":
+		return false, nil
+	case "":
+		// Git reads a key written without "=" as true but "key =" as false,
+		// and go-git's decoder reports both as an empty value.
+		return false, fmt.Errorf("%w: empty", errBadBool)
+	}
+	match := gitIntRe.FindStringSubmatch(value)
+	if match == nil {
+		return false, fmt.Errorf("%w: %q", errBadBool, value)
+	}
+	number, err := strconv.ParseInt(match[1], 0, gitIntBits[strings.ToLower(match[2])])
+	if err != nil {
+		return false, fmt.Errorf("%w: %q", errBadBool, value)
+	}
+	return number != 0, nil
+}
+
+func openRepository(dirs gitDirectories) (*git.Repository, workspaceKind, error) {
+	repoFS := osfs.New(dirs.gitDir)
 	if dirs.commonDir != dirs.gitDir {
-		repoFS = dotgit.NewRepositoryFilesystem(dotGitFS, osfs.New(dirs.commonDir))
+		if _, err := os.Stat(dirs.commonDir); err != nil {
+			return nil, workspaceNone, err
+		}
+		repoFS = dotgit.NewRepositoryFilesystem(repoFS, osfs.New(dirs.commonDir))
 	}
-	storer := &partialCloneStorer{
-		Storer: filesystem.NewStorage(repoFS, cache.NewObjectLRUDefault()),
+	storer := newCompatStorage(repoFS)
+	cfg, err := storer.Config()
+	if err != nil {
+		return nil, workspaceNone, err
 	}
-	if dirs.bare {
-		return git.Open(storer, nil)
+	workspace, err := workspaceOf(dirs, cfg)
+	if err != nil {
+		return nil, workspaceNone, err
 	}
-	return git.Open(storer, osfs.New(dirs.worktreeDir))
+	if workspace != workspaceHere {
+		repo, openErr := git.Open(storer, nil)
+		return repo, workspace, openErr
+	}
+	repo, err := git.Open(storer, osfs.New(dirs.worktreeDir))
+	return repo, workspace, err
 }
 
 func forward(state *repoState, opts *Options) (string, error) {
@@ -270,12 +365,18 @@ func forward(state *repoState, opts *Options) (string, error) {
 
 	offBranch := anchor != targetHash
 	workspaceDirty := false
-	if !targetSet && !offBranch && state.worktree != nil {
-		status, statusErr := state.worktree.Status()
-		if statusErr != nil {
-			return "", &ExitError{exitIncompleteHistory, "local history cannot prove workspace state"}
+	if !targetSet && !offBranch {
+		unprovable := &ExitError{exitIncompleteHistory, "local history cannot prove workspace state"}
+		if state.workspace == workspaceUnreachable {
+			return "", unprovable
 		}
-		workspaceDirty = !status.IsClean()
+		if state.worktree != nil {
+			status, statusErr := state.worktree.Status()
+			if statusErr != nil {
+				return "", unprovable
+			}
+			workspaceDirty = !status.IsClean()
+		}
 	}
 
 	dirty := offBranch || workspaceDirty
@@ -473,42 +574,30 @@ type gitDirectories struct {
 	gitDir      string
 	commonDir   string
 	worktreeDir string
-	bare        bool
-	atRoot      bool // the searched directory is the repository root, not a subdirectory of it
+	inGitDir    bool // the search ended in the git directory itself, with no .git entry naming it
 }
 
+// findGitDirs follows git's discovery rules, so gitcalver reads the repository
+// that git does. Like git it searches upward from the physical directory, not
+// from a symlinked path whose parents belong to another repository.
 func findGitDirs(dir string) (gitDirectories, error) {
-	start, _ := filepath.Abs(dir) //nolint:errcheck // all supported repository paths are local filesystem paths
-	if info, statErr := os.Stat(start); statErr != nil || !info.IsDir() {
+	abs, _ := filepath.Abs(dir) //nolint:errcheck // all supported repository paths are local filesystem paths
+	start, err := filepath.EvalSymlinks(abs)
+	if err != nil {
+		return gitDirectories{}, os.ErrNotExist
+	}
+	if !isDir(start) {
 		return gitDirectories{}, os.ErrNotExist
 	}
 
 	for current := start; ; current = filepath.Dir(current) {
-		gitDir, found, findErr := gitDirAt(current)
+		dirs, found, findErr := gitDirAt(current)
 		if findErr != nil {
 			return gitDirectories{}, findErr
 		}
 		if found {
-			commonDir := gitDir
-			commonData, readErr := os.ReadFile(filepath.Join(gitDir, "commondir")) //nolint:gosec // repository metadata path
-			if readErr == nil {
-				common := strings.TrimSpace(string(commonData))
-				if !filepath.IsAbs(common) {
-					common = filepath.Join(gitDir, common)
-				}
-				commonDir = filepath.Clean(common)
-			} else if !errors.Is(readErr, os.ErrNotExist) {
-				return gitDirectories{}, readErr
-			}
-			_, dotGitErr := os.Stat(filepath.Join(current, ".git"))
-			bare := errors.Is(dotGitErr, os.ErrNotExist) && gitDir == current
-			return gitDirectories{
-				gitDir:      filepath.Clean(gitDir),
-				commonDir:   commonDir,
-				worktreeDir: current,
-				bare:        bare,
-				atRoot:      current == start,
-			}, nil
+			dirs.worktreeDir = current
+			return dirs, nil
 		}
 		parent := filepath.Dir(current)
 		if parent == current {
@@ -518,35 +607,125 @@ func findGitDirs(dir string) (gitDirectories, error) {
 	return gitDirectories{}, os.ErrNotExist
 }
 
-func gitDirAt(dir string) (string, bool, error) {
+func commonDirOf(gitDir string) (string, error) {
+	data, err := os.ReadFile(filepath.Join(gitDir, "commondir")) //nolint:gosec // repository metadata path
+	if errors.Is(err, os.ErrNotExist) {
+		return filepath.Clean(gitDir), nil
+	}
+	if err != nil {
+		return "", err
+	}
+	common := strings.TrimRight(string(data), "\r\n")
+	if common == "" {
+		return "", errEmptyCommonDir
+	}
+	if !filepath.IsAbs(common) {
+		common = filepath.Join(gitDir, common)
+	}
+	return filepath.Clean(common), nil
+}
+
+func gitDirAt(dir string) (gitDirectories, bool, error) {
 	dotGit := filepath.Join(dir, ".git")
 	info, err := os.Stat(dotGit)
 	if err == nil {
 		if info.IsDir() {
-			return dotGit, true, nil
+			return namedGitDir(dotGit)
+		}
+		if !info.Mode().IsRegular() {
+			return gitDirectories{}, false, errInvalidGitFile
 		}
 		data, readErr := os.ReadFile(dotGit) //nolint:gosec // repository metadata path
 		if readErr != nil {
-			return "", false, readErr
+			return gitDirectories{}, false, readErr
 		}
-		value, ok := strings.CutPrefix(strings.TrimSpace(string(data)), "gitdir:")
+		value, ok := strings.CutPrefix(string(data), "gitdir: ")
 		if !ok {
-			return "", false, errInvalidGitFile
+			return gitDirectories{}, false, errInvalidGitFile
 		}
-		gitDir := strings.TrimSpace(value)
+		gitDir := strings.TrimRight(value, "\r\n")
+		if gitDir == "" {
+			return gitDirectories{}, false, errInvalidGitFile
+		}
 		if !filepath.IsAbs(gitDir) {
 			gitDir = filepath.Join(dir, gitDir)
 		}
-		return filepath.Clean(gitDir), true, nil
+		return namedGitDir(filepath.Clean(gitDir))
 	}
 	if !errors.Is(err, os.ErrNotExist) {
-		return "", false, err
+		return gitDirectories{}, false, err
 	}
 
-	if _, headErr := os.Stat(filepath.Join(dir, "HEAD")); headErr == nil {
-		if objects, objectsErr := os.Stat(filepath.Join(dir, "objects")); objectsErr == nil && objects.IsDir() {
-			return dir, true, nil
+	return gitDirIfValid(dir)
+}
+
+func namedGitDir(gitDir string) (gitDirectories, bool, error) {
+	commonDir, err := commonDirOf(gitDir)
+	if err != nil {
+		return gitDirectories{}, false, err
+	}
+	return gitDirectories{gitDir: gitDir, commonDir: commonDir}, true, nil
+}
+
+// gitDirIfValid applies git's is_git_directory test: a valid HEAD, plus
+// objects/ and refs/ in the common directory, which a linked worktree's git
+// directory names in its commondir file.
+func gitDirIfValid(dir string) (gitDirectories, bool, error) {
+	if !validHEAD(filepath.Join(dir, "HEAD")) {
+		return gitDirectories{}, false, nil
+	}
+	common, err := commonDirOf(dir)
+	if err != nil {
+		return gitDirectories{}, false, err
+	}
+	for _, name := range []string{"objects", "refs"} {
+		if !isDir(filepath.Join(common, name)) {
+			return gitDirectories{}, false, nil
 		}
 	}
-	return "", false, nil
+	return gitDirectories{gitDir: dir, commonDir: common, inGitDir: true}, true, nil
+}
+
+func isDir(dir string) bool {
+	info, err := os.Stat(dir)
+	return err == nil && info.IsDir()
+}
+
+// validHEAD applies git's validate_headref. Like git, it reads only the start of
+// the file, so a huge or endless HEAD in an ancestor directory cannot stall the
+// search.
+func validHEAD(file string) bool {
+	info, err := os.Lstat(file)
+	if err != nil {
+		return false
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		target, linkErr := os.Readlink(file)
+		return linkErr == nil && strings.HasPrefix(target, "refs/")
+	}
+	if !info.Mode().IsRegular() {
+		return false
+	}
+	data, err := readStart(file, headReadLimit)
+	if err != nil {
+		return false
+	}
+	text := string(data)
+	if ref, ok := strings.CutPrefix(text, "ref:"); ok {
+		return strings.HasPrefix(strings.TrimLeft(ref, " \t\n\r"), "refs/")
+	}
+	if len(text) < hexObjectIDLength {
+		return false
+	}
+	_, decodeErr := hex.DecodeString(text[:hexObjectIDLength])
+	return decodeErr == nil
+}
+
+func readStart(file string, limit int64) (data []byte, err error) {
+	f, err := os.Open(file) //nolint:gosec // repository metadata path
+	if err != nil {
+		return nil, err
+	}
+	defer func() { err = errors.Join(err, f.Close()) }()
+	return io.ReadAll(io.LimitReader(f, limit))
 }

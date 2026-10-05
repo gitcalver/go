@@ -112,6 +112,22 @@ Dirty versions cannot be reversed.
 | 3    | Complete history proves the target is on an unrelated chain |
 | 4    | Local history is insufficient to prove the result           |
 
+## Finding the repository
+
+GitCalVer searches upward from the current directory, after resolving symlinks,
+and uses the repository at the first directory that has a `.git` directory or
+file, or is itself a Git directory. Unlike Git, it ignores `GIT_*` environment
+variables (including `GIT_DIR`, `GIT_WORK_TREE`, and `GIT_CEILING_DIRECTORIES`)
+and `core.worktree`, does not stop at filesystem boundaries or check ownership,
+and reports an error for a `.git` directory that is not a valid Git directory
+instead of skipping it.
+
+A repository with `core.bare` set to true has no workspace to inspect, but its
+linked worktrees do. Inside the Git directory (usually `.git`) of a repository
+that has a working tree, GitCalVer cannot inspect that tree. With no revision
+and `HEAD` on the default branch it exits with code 4. Name a revision such as
+`HEAD` there instead.
+
 ## History requirements
 
 Calculations are always offline. Shallow and partial clones work when their

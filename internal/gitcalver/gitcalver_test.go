@@ -14,12 +14,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/go-git/go-billy/v5/osfs"
 	git "github.com/go-git/go-git/v5"
-	"github.com/go-git/go-git/v5/config"
 	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/go-git/go-git/v5/plumbing/object"
-	"github.com/go-git/go-git/v5/storage"
-	"github.com/go-git/go-git/v5/storage/memory"
 )
 
 func testRepo(t *testing.T) (string, func(dateStr string)) {
@@ -2345,46 +2343,161 @@ func TestMissingPromisorCommitIsIncomplete(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err = openRepository(dir, false); err != nil {
+	if _, err = openRepositoryAt(dir); err != nil {
 		t.Fatalf("open partial repository: %T: %v", err, err)
 	}
 	_, code := runCmd(t, dir, "HEAD")
 	assertEqual(t, 4, code)
 }
 
-func TestPartialCloneStorageErrors(t *testing.T) {
+func TestCompatStorageConfig(t *testing.T) {
 	t.Parallel()
-	base := memory.NewStorage()
-	storerWithoutExtensions := &partialCloneStorer{Storer: base}
-	cfg, err := storerWithoutExtensions.Config()
+	t.Run("without extensions", func(t *testing.T) {
+		t.Parallel()
+		dir, _ := testRepo(t)
+		cfg, err := newCompatStorage(osfs.New(filepath.Join(dir, ".git"))).Config()
+		if err != nil {
+			t.Fatal(err)
+		}
+		assertEqual(t, false, cfg.Raw.HasSection("extensions"))
+	})
+	t.Run("unreadable", func(t *testing.T) {
+		t.Parallel()
+		dir, _ := testRepo(t)
+		if err := os.WriteFile(filepath.Join(dir, ".git", "config"), []byte("key: value\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := newCompatStorage(osfs.New(filepath.Join(dir, ".git"))).Config(); err == nil {
+			t.Fatal("expected config error")
+		}
+	})
+}
+
+func TestCompatStorageKeepsPrefixLookup(t *testing.T) {
+	t.Parallel()
+	dir, commitAt := testRepo(t)
+	commitAt("2026-04-10T09:00:00Z")
+	enablePartialClone(t, filepath.Join(dir, ".git", "config"))
+
+	repo, err := openRepositoryAt(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	assertEqual(t, false, cfg.Raw.HasSection("extensions"))
-
-	storer := &partialCloneStorer{Storer: &configErrorStorer{Storer: base}}
-	if _, err := storer.Config(); err == nil {
-		t.Fatal("expected config error")
-	}
-	if _, err := openRepositoryIgnoringPartialClone(t.TempDir()); err == nil {
-		t.Fatal("expected repository discovery error")
+	if _, ok := repo.Storer.(interface {
+		HashesWithPrefix(prefix []byte) ([]plumbing.Hash, error)
+	}); !ok {
+		t.Fatal("storer hides the filesystem prefix lookup")
 	}
 }
 
-func TestPartialCloneLinkedWorktreeStorage(t *testing.T) {
+func TestCompatStorageModule(t *testing.T) {
+	t.Parallel()
+	t.Run("escaping name", func(t *testing.T) {
+		t.Parallel()
+		dir, _ := testRepo(t)
+		_, err := newCompatStorage(osfs.New(filepath.Join(dir, ".git"))).Module("../../escape")
+		if err == nil {
+			t.Fatal("expected error for a name outside the modules directory")
+		}
+	})
+}
+
+func submoduleRepo(t *testing.T) string {
+	t.Helper()
+	subDir, subCommitAt := testRepo(t)
+	subCommitAt("2026-04-09T09:00:00Z")
+	dir, commitAt := testRepo(t)
+	gitCLI(t, "-C", dir, "-c", "protocol.file.allow=always", "submodule", "add", subDir, "libs/sub")
+	commitAt("2026-04-10T09:00:00Z")
+	return dir
+}
+
+// advanceSubmodule commits to the submodule's git directory rather than through
+// the .git file in its working tree, so the commit lands in the repository
+// gitcalver is meant to read even if a run has repointed that file.
+func advanceSubmodule(t *testing.T, moduleDir string) {
+	t.Helper()
+	gitCLI(t, "--git-dir", moduleDir, "-c", "user.name=Test", "-c", "user.email=test@test.com",
+		"commit", "--allow-empty", "-m", "advance")
+}
+
+func TestSubmoduleWithExtensions(t *testing.T) {
+	t.Parallel()
+	dir := submoduleRepo(t)
+	moduleDir := filepath.Join(dir, ".git", "modules", "libs", "sub")
+	moduleConfig := filepath.Join(moduleDir, "config")
+	gitCLI(t, "config", "--file", moduleConfig, "core.repositoryformatversion", "1")
+	gitCLI(t, "config", "--file", moduleConfig, "extensions.partialClone", "origin")
+
+	out, code := runCmd(t, dir)
+	assertEqual(t, 0, code)
+	assertEqual(t, "20260410.1", out)
+
+	advanceSubmodule(t, moduleDir)
+	out, code = runCmd(t, dir)
+	assertEqual(t, 2, code)
+	assertEqual(t, "gitcalver: workspace is dirty; use --dirty to allow", out)
+}
+
+func TestLinkedWorktreeSubmodule(t *testing.T) {
+	t.Parallel()
+	dir := submoduleRepo(t)
+	linked := filepath.Join(t.TempDir(), "linked")
+	gitCLI(t, "-C", dir, "worktree", "add", "--detach", linked, "HEAD")
+	gitCLI(t, "-C", linked, "-c", "protocol.file.allow=always", "submodule", "update", "--init")
+
+	out, code := runCmd(t, linked)
+	assertEqual(t, 0, code)
+	assertEqual(t, "20260410.1", out)
+
+	advanceSubmodule(t, filepath.Join(dir, ".git", "worktrees", "linked", "modules", "libs", "sub"))
+	out, code = runCmd(t, linked)
+	assertEqual(t, 2, code)
+	assertEqual(t, "gitcalver: workspace is dirty; use --dirty to allow", out)
+}
+
+func TestOpenRepository(t *testing.T) {
 	t.Parallel()
 	dir, commitAt := testRepo(t)
 	commitAt("2026-04-10T09:00:00Z")
 	linked := filepath.Join(t.TempDir(), "linked")
 	gitCLI(t, "-C", dir, "worktree", "add", "--detach", linked, "HEAD")
+	bare := filepath.Join(t.TempDir(), "bare.git")
+	gitCLI(t, "clone", "--bare", dir, bare)
 
-	repo, err := openRepositoryIgnoringPartialClone(linked)
-	if err != nil {
-		t.Fatal(err)
+	for _, tc := range []struct {
+		name, dir string
+		bare      bool
+	}{
+		{"worktree", dir, false},
+		{"linked worktree", linked, false},
+		{"bare", bare, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			repo, err := openRepositoryAt(tc.dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err = repo.Head(); err != nil {
+				t.Fatal(err)
+			}
+			_, err = repo.Worktree()
+			assertEqual(t, tc.bare, errors.Is(err, git.ErrIsBareRepository))
+		})
 	}
-	if _, err = repo.Head(); err != nil {
-		t.Fatal(err)
-	}
+
+	t.Run("missing common directory", func(t *testing.T) {
+		t.Parallel()
+		dirs, err := findGitDirs(linked)
+		if err != nil {
+			t.Fatal(err)
+		}
+		dirs.commonDir = filepath.Join(t.TempDir(), "missing")
+		if _, _, err = openRepository(dirs); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("expected a not-exist error, got %v", err)
+		}
+	})
 }
 
 func TestGitDirectoryDiscovery(t *testing.T) {
@@ -2397,6 +2510,12 @@ func TestGitDirectoryDiscovery(t *testing.T) {
 		}
 		if _, err := findGitDirs(path); err == nil {
 			t.Fatal("expected non-directory error")
+		}
+	})
+	t.Run("missing directory", func(t *testing.T) {
+		t.Parallel()
+		if _, err := findGitDirs(filepath.Join(t.TempDir(), "missing")); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("expected a not-exist error, got %v", err)
 		}
 	})
 	t.Run("not a repository", func(t *testing.T) {
@@ -2417,12 +2536,15 @@ func TestGitDirectoryDiscovery(t *testing.T) {
 	})
 	t.Run("relative git file", func(t *testing.T) {
 		t.Parallel()
-		dir := t.TempDir()
-		gitDir := filepath.Join(dir, "metadata")
-		if err := os.Mkdir(gitDir, 0o755); err != nil {
+		dir, err := filepath.EvalSymlinks(t.TempDir())
+		if err != nil {
 			t.Fatal(err)
 		}
-		if err := os.WriteFile(filepath.Join(dir, ".git"), []byte("gitdir: metadata\n"), 0o644); err != nil {
+		gitDir := filepath.Join(dir, "metadata")
+		if err = os.Mkdir(gitDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err = os.WriteFile(filepath.Join(dir, ".git"), []byte("gitdir: metadata\n"), 0o644); err != nil {
 			t.Fatal(err)
 		}
 		dirs, err := findGitDirs(dir)
@@ -2816,14 +2938,581 @@ func TestForwardCorruptIndexStatusError(t *testing.T) {
 	assertEqual(t, 4, code)
 }
 
-// --- Helpers ---
+// --- Repository discovery ---
 
-type configErrorStorer struct {
-	storage.Storer
+type discoveryOutcome struct {
+	out  string
+	code int
 }
 
-func (*configErrorStorer) Config() (*config.Config, error) {
-	return nil, errors.New("config error")
+func TestRepositoryDiscoveryLayouts(t *testing.T) {
+	t.Parallel()
+
+	mkdirs := func(elem ...string) string {
+		t.Helper()
+		path := filepath.Join(elem...)
+		if err := os.MkdirAll(path, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	write := func(text string, elem ...string) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(elem...), []byte(text), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// main: two commits on 2026-04-10, so 20260410.2.
+	mainDir, commitAt := testRepo(t)
+	commitAt("2026-04-10T09:00:00Z")
+	commitAt("2026-04-10T10:00:00Z")
+	mkdirs(mainDir, ".git", "info")
+	write("stray/\nnested.git/\n", mainDir, ".git", "info", "exclude")
+	sub := mkdirs(mainDir, "sub")
+
+	// A bare repository nested in the worktree has its own history: 20260411.3.
+	nestedSrc, nestedCommitAt := testRepo(t)
+	nestedCommitAt("2026-04-11T09:00:00Z")
+	nestedCommitAt("2026-04-11T10:00:00Z")
+	nestedCommitAt("2026-04-11T11:00:00Z")
+	nestedBare := filepath.Join(mainDir, "nested.git")
+	gitCLI(t, "clone", "--bare", nestedSrc, nestedBare)
+
+	// A linked worktree checked out one commit back: 20260410.1.
+	linked := filepath.Join(t.TempDir(), "linked")
+	gitCLI(t, "-C", mainDir, "worktree", "add", "--detach", linked, "HEAD~1")
+	linkedSub := mkdirs(linked, "sub")
+	brokenLinked := filepath.Join(t.TempDir(), "broken")
+	gitCLI(t, "-C", mainDir, "worktree", "add", "--detach", brokenLinked, "HEAD")
+	write("/nonexistent\n", mainDir, ".git", "worktrees", "broken", "commondir")
+
+	bare := filepath.Join(t.TempDir(), "bare.git")
+	gitCLI(t, "clone", "--bare", mainDir, bare)
+
+	// The bare-repository-plus-worktrees layout: .git is a file naming the
+	// bare repository, and the container directory has no working tree. The
+	// worktree is dirty because the shared core.bare=true does not make it bare.
+	container := t.TempDir()
+	gitCLI(t, "clone", "--bare", mainDir, filepath.Join(container, ".bare"))
+	write("gitdir: ./.bare\n", container, ".git")
+	containerWorktree := filepath.Join(container, "wt")
+	gitCLI(t, "-C", filepath.Join(container, ".bare"), "worktree", "add", "--detach", containerWorktree, "HEAD")
+	write("untracked\n", containerWorktree, "untracked.txt")
+
+	// core.bare=true on a repository with a .git directory and a dirty tree.
+	bareFlagged := filepath.Join(t.TempDir(), "flagged")
+	gitCLI(t, "clone", mainDir, bareFlagged)
+	gitCLI(t, "-C", bareFlagged, "config", "core.bare", "true")
+	write("untracked\n", bareFlagged, "untracked.txt")
+
+	bareUnset := filepath.Join(t.TempDir(), "unset.git")
+	gitCLI(t, "clone", "--bare", mainDir, bareUnset)
+	gitCLI(t, "config", "--file", filepath.Join(bareUnset, "config"), "--unset", "core.bare")
+	bareYes := filepath.Join(t.TempDir(), "yes.git")
+	gitCLI(t, "clone", "--bare", mainDir, bareYes)
+	gitCLI(t, "config", "--file", filepath.Join(bareYes, "config"), "core.bare", "yes")
+	bareFalse := filepath.Join(t.TempDir(), "false.git")
+	gitCLI(t, "clone", "--bare", mainDir, bareFalse)
+	gitCLI(t, "config", "--file", filepath.Join(bareFalse, "config"), "core.bare", "false")
+
+	// Directories that hold some of what makes a git directory, but not all
+	// of it. git passes over each of them and keeps searching upward.
+	stray := filepath.Join(mainDir, "stray")
+	headRef := "ref: refs/heads/main\n"
+	for name, head := range map[string]string{
+		"head-only":        headRef,
+		"head-objects":     headRef,
+		"head-refs":        headRef,
+		"garbage-head":     "garbage\n",
+		"non-hex-head":     strings.Repeat("z", 40) + "\n",
+		"head-outside-ref": "ref: heads/main\n",
+	} {
+		mkdirs(stray, name)
+		write(head, stray, name, "HEAD")
+	}
+	mkdirs(stray, "head-objects", "objects")
+	mkdirs(stray, "head-refs", "refs")
+	for _, name := range []string{"garbage-head", "non-hex-head", "head-outside-ref"} {
+		mkdirs(stray, name, "objects")
+		mkdirs(stray, name, "refs")
+	}
+	mkdirs(stray, "config-only")
+	write("[core]\n\tbare = true\n", stray, "config-only", "config")
+	mkdirs(stray, "commondir-only")
+	write("../..\n", stray, "commondir-only", "commondir")
+	mkdirs(stray, "commondir-without-objects")
+	write(headRef, stray, "commondir-without-objects", "HEAD")
+	write("../..\n", stray, "commondir-without-objects", "commondir")
+
+	// Things git does treat as a repository. These are empty, so there are
+	// no commits to version.
+	mkdirs(stray, "empty-bare", "objects")
+	mkdirs(stray, "empty-bare", "refs")
+	write(headRef, stray, "empty-bare", "HEAD")
+	mkdirs(stray, "detached-missing", "objects")
+	mkdirs(stray, "detached-missing", "refs")
+	write(strings.Repeat("a", 40)+"\n", stray, "detached-missing", "HEAD")
+
+	// git stops at an unreadable gitfile or commondir instead of searching on.
+	// An empty .git directory also stops the search, which git would pass over:
+	// a damaged repository is reported, not replaced by the one around it.
+	mkdirs(stray, "empty-dot-git", ".git")
+	mkdirs(stray, "bad-gitfile")
+	write("not a gitfile\n", stray, "bad-gitfile", ".git")
+	mkdirs(stray, "commondir-directory", "commondir")
+	write(headRef, stray, "commondir-directory", "HEAD")
+
+	same := func(out string, code int) [2]discoveryOutcome {
+		return [2]discoveryOutcome{{out, code}, {out, code}}
+	}
+	const (
+		unprovable = "gitcalver: local history cannot prove workspace state"
+		dirty      = "gitcalver: workspace is dirty; use --dirty to allow"
+	)
+	// Inside the git directory of a repository that has a working tree, the
+	// working tree cannot be inspected, so only an explicit target works.
+	insideGitDir := func(explicit string) [2]discoveryOutcome {
+		return [2]discoveryOutcome{{unprovable, 4}, {explicit, 0}}
+	}
+
+	// results are {omitted target, explicit HEAD}.
+	for _, tc := range []struct {
+		name    string
+		dir     string
+		args    []string
+		results [2]discoveryOutcome
+	}{
+		{"worktree root", mainDir, nil, same("20260410.2", 0)},
+		{"worktree subdirectory", sub, nil, same("20260410.2", 0)},
+		{"git directory", filepath.Join(mainDir, ".git"), nil, insideGitDir("20260410.2")},
+		{
+			"git directory with --dirty",
+			filepath.Join(mainDir, ".git"),
+			[]string{"--dirty", "-dirty"},
+			insideGitDir("20260410.2"),
+		},
+		{"git refs/heads", filepath.Join(mainDir, ".git", "refs", "heads"), nil, insideGitDir("20260410.2")},
+		{"git objects", filepath.Join(mainDir, ".git", "objects"), nil, insideGitDir("20260410.2")},
+
+		{"linked worktree root", linked, nil, same("20260410.1", 0)},
+		{"linked worktree subdirectory", linkedSub, nil, same("20260410.1", 0)},
+		// The linked worktree's own HEAD, not the main worktree's.
+		{
+			"linked worktree git directory",
+			filepath.Join(mainDir, ".git", "worktrees", "linked"), nil, insideGitDir("20260410.1"),
+		},
+
+		{"bare root", bare, nil, same("20260410.2", 0)},
+		{"bare refs/heads", filepath.Join(bare, "refs", "heads"), nil, same("20260410.2", 0)},
+		{"bare objects", filepath.Join(bare, "objects"), nil, same("20260410.2", 0)},
+		{"bare core.bare unset", bareUnset, nil, same("20260410.2", 0)},
+		{"bare core.bare yes", bareYes, nil, same("20260410.2", 0)},
+		{"bare core.bare false", bareFalse, nil, insideGitDir("20260410.2")},
+
+		// The nested repository wins over the repository around it.
+		{"nested bare root", nestedBare, nil, same("20260411.3", 0)},
+		{"nested bare refs/heads", filepath.Join(nestedBare, "refs", "heads"), nil, same("20260411.3", 0)},
+
+		{"bare container root", container, nil, same("20260410.2", 0)},
+		{"bare container git directory", filepath.Join(container, ".bare"), nil, same("20260410.2", 0)},
+		{"bare container worktree", containerWorktree, nil, [2]discoveryOutcome{{dirty, 2}, {"20260410.2", 0}}},
+		{
+			"bare container worktree git directory",
+			filepath.Join(container, ".bare", "worktrees", "wt"), nil, same("20260410.2", 0),
+		},
+		{"core.bare=true with a .git directory", bareFlagged, nil, same("20260410.2", 0)},
+
+		{"stray HEAD only", filepath.Join(stray, "head-only"), nil, same("20260410.2", 0)},
+		{"stray HEAD and objects", filepath.Join(stray, "head-objects"), nil, same("20260410.2", 0)},
+		{"stray HEAD and refs", filepath.Join(stray, "head-refs"), nil, same("20260410.2", 0)},
+		{"stray config only", filepath.Join(stray, "config-only"), nil, same("20260410.2", 0)},
+		{"stray commondir only", filepath.Join(stray, "commondir-only"), nil, same("20260410.2", 0)},
+		{"commondir without objects", filepath.Join(stray, "commondir-without-objects"), nil, same("20260410.2", 0)},
+		{"garbage HEAD", filepath.Join(stray, "garbage-head"), nil, same("20260410.2", 0)},
+		{"non-hex detached HEAD", filepath.Join(stray, "non-hex-head"), nil, same("20260410.2", 0)},
+		{"HEAD ref outside refs", filepath.Join(stray, "head-outside-ref"), nil, same("20260410.2", 0)},
+
+		{"empty bare repository", filepath.Join(stray, "empty-bare"), nil, same("gitcalver: no commits in repository", 1)},
+		{
+			"detached HEAD at a missing commit",
+			filepath.Join(stray, "detached-missing"), nil,
+			same("gitcalver: HEAD commit is missing from local history", 4),
+		},
+		{"invalid .git file", filepath.Join(stray, "bad-gitfile"), nil, same("gitcalver: not a git repository", 1)},
+		{
+			"unreadable commondir",
+			filepath.Join(stray, "commondir-directory"), nil, same("gitcalver: not a git repository", 1),
+		},
+		{"empty .git directory", filepath.Join(stray, "empty-dot-git"), nil, same("gitcalver: not a git repository", 1)},
+		{"linked worktree with a missing common directory", brokenLinked, nil, same("gitcalver: not a git repository", 1)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			out, code := runCmd(t, tc.dir, tc.args...)
+			assertEqual(t, tc.results[0], discoveryOutcome{out, code})
+			out, code = runCmd(t, tc.dir, append([]string{"HEAD"}, tc.args...)...)
+			assertEqual(t, tc.results[1], discoveryOutcome{out, code})
+		})
+	}
+}
+
+func TestMalformedGitMetadata(t *testing.T) {
+	t.Parallel()
+	mainDir, commitAt := testRepo(t)
+	commitAt("2026-04-10T09:00:00Z")
+	commitAt("2026-04-10T10:00:00Z")
+
+	write := func(text string, elem ...string) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(elem...), []byte(text), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// git refuses every worktree command once one of them is damaged, so
+	// create them all before damaging any.
+	worktrees := t.TempDir()
+	for _, name := range []string{"crlf", "empty-commondir", "newline-commondir", "empty-gitdir", "no-space", "indented"} {
+		gitCLI(t, "-C", mainDir, "worktree", "add", "--detach", filepath.Join(worktrees, name), "HEAD~1")
+	}
+	adminDir := func(name string) string {
+		return filepath.Join(mainDir, ".git", "worktrees", name)
+	}
+	write("../..\r\n", adminDir("crlf"), "commondir")
+	write("gitdir: "+adminDir("crlf")+"\r\n", worktrees, "crlf", ".git")
+	write("", adminDir("empty-commondir"), "commondir")
+	write("\n", adminDir("newline-commondir"), "commondir")
+	write("gitdir: \n", worktrees, "empty-gitdir", ".git")
+	write("gitdir:"+adminDir("no-space")+"\n", worktrees, "no-space", ".git")
+	write("  gitdir: "+adminDir("indented")+"\n", worktrees, "indented", ".git")
+
+	stray := filepath.Join(mainDir, "stray")
+	if err := os.Mkdir(stray, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	write("ref: refs/heads/main\n", stray, "HEAD")
+	write("", stray, "commondir")
+
+	// git passes over a directory whose objects is not a directory.
+	objectsFile := filepath.Join(mainDir, "objects-file")
+	if err := os.MkdirAll(filepath.Join(objectsFile, "refs"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	write("ref: refs/heads/main\n", objectsFile, "HEAD")
+	write("", objectsFile, "objects")
+
+	refused := discoveryOutcome{"gitcalver: not a git repository", 1}
+	for _, tc := range []struct {
+		name string
+		dir  string
+		want discoveryOutcome
+	}{
+		{"CRLF line endings", filepath.Join(worktrees, "crlf"), discoveryOutcome{"20260410.1", 0}},
+		{"empty commondir in a linked worktree", filepath.Join(worktrees, "empty-commondir"), refused},
+		{"commondir holding only a newline", filepath.Join(worktrees, "newline-commondir"), refused},
+		{"gitdir without a path", filepath.Join(worktrees, "empty-gitdir"), refused},
+		{"gitdir without a space", filepath.Join(worktrees, "no-space"), refused},
+		{"gitdir after whitespace", filepath.Join(worktrees, "indented"), refused},
+		{"empty commondir in a stray directory", stray, refused},
+		{"objects is a file", objectsFile, discoveryOutcome{"20260410.2", 0}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			out, code := runCmd(t, tc.dir, "HEAD")
+			assertEqual(t, tc.want, discoveryOutcome{out, code})
+		})
+	}
+}
+
+func makeFIFO(t *testing.T, path string) {
+	t.Helper()
+	if output, err := exec.Command("mkfifo", path).CombinedOutput(); err != nil {
+		t.Fatalf("mkfifo: %v: %s", err, output)
+	}
+}
+
+func TestGitEntryNotRegular(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	makeFIFO(t, filepath.Join(dir, ".git"))
+
+	// Reading a FIFO blocks until something writes to it.
+	result := make(chan error, 1)
+	go func() {
+		_, _, err := gitDirAt(dir)
+		result <- err
+	}()
+	select {
+	case err := <-result:
+		if !errors.Is(err, errInvalidGitFile) {
+			t.Fatalf("expected an invalid .git file error, got %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("gitDirAt blocked reading a .git FIFO")
+	}
+}
+
+func TestValidHEADNotRegular(t *testing.T) {
+	t.Parallel()
+	head := filepath.Join(t.TempDir(), "HEAD")
+	makeFIFO(t, head)
+
+	// Reading a FIFO blocks until something writes to it.
+	result := make(chan bool, 1)
+	go func() { result <- validHEAD(head) }()
+	select {
+	case valid := <-result:
+		assertEqual(t, false, valid)
+	case <-time.After(5 * time.Second):
+		t.Fatal("validHEAD blocked reading a HEAD FIFO")
+	}
+}
+
+func TestGitEntryWorkspace(t *testing.T) {
+	t.Parallel()
+	source, commitAt := testRepo(t)
+	commitAt("2026-04-10T09:00:00Z")
+
+	// Git applies core.bare through a .git entry only when the config has a
+	// repositoryformatversion.
+	unversioned := filepath.Join(t.TempDir(), "unversioned")
+	gitCLI(t, "clone", source, unversioned)
+	unversionedConfig := filepath.Join(unversioned, ".git", "config")
+	gitCLI(t, "config", "--file", unversionedConfig, "core.bare", "true")
+	gitCLI(t, "config", "--file", unversionedConfig, "--unset", "core.repositoryformatversion")
+
+	// A .git file that names its own directory makes it the git directory and
+	// the working tree, so the repository's own files are untracked.
+	selfNamed := filepath.Join(t.TempDir(), "self-named")
+	gitCLI(t, "clone", "--bare", source, selfNamed)
+	gitCLI(t, "config", "--file", filepath.Join(selfNamed, "config"), "core.bare", "false")
+	if err := os.WriteFile(filepath.Join(selfNamed, ".git"), []byte("gitdir: .\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	dirty := discoveryOutcome{"gitcalver: workspace is dirty; use --dirty to allow", 2}
+	for _, tc := range []struct{ name, dir string }{
+		{"core.bare without a format version", unversioned},
+		{"git file naming its own directory", selfNamed},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if err := os.WriteFile(filepath.Join(tc.dir, "untracked.txt"), nil, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			out, code := runCmd(t, tc.dir)
+			assertEqual(t, dirty, discoveryOutcome{out, code})
+			out, code = runCmd(t, tc.dir, "HEAD")
+			assertEqual(t, discoveryOutcome{"20260410.1", 0}, discoveryOutcome{out, code})
+		})
+	}
+}
+
+func TestSymlinkedWorkingDirectory(t *testing.T) {
+	t.Parallel()
+	outer, outerCommitAt := testRepo(t)
+	outerCommitAt("2026-04-01T09:00:00Z")
+	inner, innerCommitAt := testRepo(t)
+	innerCommitAt("2026-04-02T09:00:00Z")
+	innerCommitAt("2026-04-02T10:00:00Z")
+	sub := filepath.Join(inner, "sub")
+	if err := os.Mkdir(sub, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(outer, "link")
+	if err := os.Symlink(sub, link); err != nil {
+		t.Fatal(err)
+	}
+
+	out, code := runCmd(t, link, "HEAD")
+	assertEqual(t, 0, code)
+	assertEqual(t, "20260402.2", out)
+}
+
+func TestGitBool(t *testing.T) {
+	t.Parallel()
+	// Words, and integers as strtoimax reads them with base 0, where a unit
+	// multiplies the number and the product must fit a C int.
+	for _, tc := range []struct {
+		value string
+		want  bool
+	}{
+		{"true", true},
+		{"TRUE", true},
+		{"Yes", true},
+		{"oN", true},
+		{"false", false},
+		{"No", false},
+		{"OFF", false},
+
+		{"1", true},
+		{"2", true},
+		{"-1", true},
+		{"+1", true},
+		{"0", false},
+		{"-0", false},
+		{"00", false},
+		{"0x0", false},
+		{"0x1", true},
+		{"0XfF", true},
+		{"01", true},
+		{"07", true},
+		{" 1", true},
+		{"\t\v\f\r\n1", true},
+
+		{"1k", true},
+		{"1K", true},
+		{"1m", true},
+		{"1G", true},
+		{"0x1g", true},
+		{"0k", false},
+		{"-0g", false},
+		{"2147483647", true},
+		{"-2147483648", true},
+		{"2097151k", true},
+		{"-2097152k", true},
+		{"2047m", true},
+		{"-2g", true},
+	} {
+		t.Run(tc.value, func(t *testing.T) {
+			t.Parallel()
+			got, err := gitBool(tc.value)
+			if err != nil {
+				t.Fatal(err)
+			}
+			assertEqual(t, tc.want, got)
+		})
+	}
+
+	for _, value := range []string{
+		"maybe", "t", "tru", "true false", " true",
+		"08", "0x", "0b1", "0o1", "1_0", "1.0", "1e3", "1 ", "-",
+		"1kb", "1gg", "1 k", "k", "0xk",
+		"2147483648", "-2147483649", "0xffffffff", "99999999999999999999",
+		"2097152k", "-2097153k", "2048m", "2g", "-3g",
+		// go-git reads a key written without "=", which git takes as true, as
+		// an empty value, which git takes as false.
+		"",
+	} {
+		t.Run("invalid "+value, func(t *testing.T) {
+			t.Parallel()
+			if _, err := gitBool(value); !errors.Is(err, errBadBool) {
+				t.Fatalf("expected a bad boolean error, got %v", err)
+			}
+		})
+	}
+}
+
+func TestCoreBareSettings(t *testing.T) {
+	t.Parallel()
+	source, commitAt := testRepo(t)
+	commitAt("2026-04-10T09:00:00Z")
+
+	for _, tc := range []struct {
+		name, settings, out string
+		code                int
+	}{
+		{"nonzero integer", "\tbare = 2\n", "20260410.1", 0},
+		{"hexadecimal", "\tbare = 0x1\n", "20260410.1", 0},
+		{"malformed", "\tbare = maybe\n", "gitcalver: not a git repository", 1},
+		{"malformed before a valid setting", "\tbare = maybe\n\tbare = true\n", "gitcalver: not a git repository", 1},
+		{"without a value", "\tbare\n", "gitcalver: not a git repository", 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			checkout := filepath.Join(t.TempDir(), "checkout")
+			gitCLI(t, "clone", source, checkout)
+			// Untracked, so the workspace is dirty unless core.bare takes it away.
+			if err := os.WriteFile(filepath.Join(checkout, "untracked.txt"), nil, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			bare := filepath.Join(t.TempDir(), "bare.git")
+			gitCLI(t, "clone", "--bare", source, bare)
+
+			for _, layout := range []struct{ name, dir, config string }{
+				{"checkout", checkout, filepath.Join(checkout, ".git", "config")},
+				{"bare", bare, filepath.Join(bare, "config")},
+			} {
+				config := "[core]\n\trepositoryformatversion = 0\n" + tc.settings
+				if err := os.WriteFile(layout.config, []byte(config), 0o644); err != nil {
+					t.Fatal(err)
+				}
+				t.Run(layout.name, func(t *testing.T) {
+					out, code := runCmd(t, layout.dir)
+					assertEqual(t, discoveryOutcome{tc.out, tc.code}, discoveryOutcome{out, code})
+				})
+			}
+		})
+	}
+}
+
+func TestValidHEAD(t *testing.T) {
+	t.Parallel()
+
+	oid := strings.Repeat("a", 40)
+	write := func(text string) func(string) error {
+		return func(head string) error { return os.WriteFile(head, []byte(text), 0o600) }
+	}
+	link := func(target string) func(string) error {
+		return func(head string) error { return os.Symlink(target, head) }
+	}
+	for _, tc := range []struct {
+		name  string
+		setup func(head string) error
+		want  bool
+	}{
+		{"symbolic ref", write("ref: refs/heads/main\n"), true},
+		{"symbolic ref without newline", write("ref: refs/heads/main"), true},
+		{"no space after colon", write("ref:refs/heads/main\n"), true},
+		{"git whitespace after colon", write("ref:\t\r\n refs/heads/main\n"), true},
+		{"ref outside refs", write("ref: heads/main\n"), false},
+		{"vertical tab after colon", write("ref:\vrefs/heads/main\n"), false},
+		{"form feed after colon", write("ref:\frefs/heads/main\n"), false},
+		{"non-breaking space after colon", write("ref:\u00a0refs/heads/main\n"), false},
+		{"refs/ ends at byte 255", write("ref:" + strings.Repeat(" ", 246) + "refs/heads/main\n"), true},
+		{"refs/ cut off at byte 255", write("ref:" + strings.Repeat(" ", 247) + "refs/heads/main\n"), false},
+		{"detached object ID", write(oid + "\n"), true},
+		{"upper-case object ID", write(strings.ToUpper(oid)), true},
+		{"object ID followed by text", write(oid + " detached\n"), true},
+		{"short object ID", write(oid[:39] + "\n"), false},
+		{"non-hex object ID", write(strings.Repeat("z", 40) + "\n"), false},
+		{"empty file", write(""), false},
+		{"missing", func(string) error { return nil }, false},
+		{"directory", func(head string) error { return os.Mkdir(head, 0o755) }, false},
+		{"unreadable file", func(head string) error {
+			return os.WriteFile(head, []byte("ref: refs/heads/main\n"), 0o000)
+		}, false},
+		{"symlink into refs", link("refs/heads/main"), true},
+		{"symlink outside refs", link("./refs/heads/main"), false},
+		{"symlink to endless file", link("/dev/zero"), false},
+		{"symlink to file holding a ref", func(head string) error {
+			other := filepath.Join(filepath.Dir(head), "other")
+			if err := os.WriteFile(other, []byte("ref: refs/heads/main\n"), 0o600); err != nil {
+				return err
+			}
+			return os.Symlink(other, head)
+		}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			head := filepath.Join(t.TempDir(), "HEAD")
+			if err := tc.setup(head); err != nil {
+				t.Fatal(err)
+			}
+			assertEqual(t, tc.want, validHEAD(head))
+		})
+	}
+}
+
+// --- Helpers ---
+
+func openRepositoryAt(dir string) (*git.Repository, error) {
+	dirs, err := findGitDirs(dir)
+	if err != nil {
+		return nil, err
+	}
+	repo, _, err := openRepository(dirs)
+	return repo, err
 }
 
 func writeCommit(
