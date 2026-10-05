@@ -72,6 +72,15 @@ Use `--no-dirty` to explicitly refuse dirty versions (overrides `--dirty`).
 
 Dirty versions are a convenience and are not necessarily unique.
 
+Changes inside a populated submodule, at any depth, make the workspace dirty.
+Settings that hide them from `git status` (`submodule.<name>.ignore`,
+`diff.ignoreSubmodules`, `status.showUntrackedFiles`) do not apply. A
+submodule's ignore rules come from its `.gitignore` files and the `info/exclude`
+file in its git directory. A submodule directory that holds a repository
+GitCalVer cannot match to the submodule, such as a clone of its own, or a
+submodule that is populated but not initialized (`git submodule init` fixes
+that), exits with code 4, as does any part of a submodule it cannot read.
+
 ### Reverse lookup
 
 Pass a version number instead of a revision to get the corresponding commit hash:

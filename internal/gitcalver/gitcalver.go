@@ -13,8 +13,10 @@ import (
 	"path"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/go-git/go-billy/v5"
@@ -23,6 +25,7 @@ import (
 	"github.com/go-git/go-git/v5/config"
 	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/go-git/go-git/v5/plumbing/cache"
+	"github.com/go-git/go-git/v5/plumbing/filemode"
 	cfgformat "github.com/go-git/go-git/v5/plumbing/format/config"
 	"github.com/go-git/go-git/v5/plumbing/object"
 	"github.com/go-git/go-git/v5/storage"
@@ -54,6 +57,8 @@ var (
 	errInvalidGitFile      = errors.New("invalid .git file")
 	errEmptyCommonDir      = errors.New("empty commondir file")
 	errSubmoduleRepository = errors.New("submodule repository is not under .git/modules")
+	errSubmoduleSymlink    = errors.New("submodule path is a symbolic link")
+	errSubmoduleNotInit    = errors.New("populated submodule is not initialized")
 )
 
 var errBadBool = errors.New("bad boolean config value")
@@ -189,7 +194,11 @@ type compatStorage struct {
 }
 
 func newCompatStorage(fs billy.Filesystem) *compatStorage {
-	return &compatStorage{filesystem.NewStorage(fs, cache.NewObjectLRUDefault())}
+	// An alternates file names absolute paths, which a filesystem rooted at the
+	// git directory cannot reach.
+	return &compatStorage{filesystem.NewStorageWithOptions(
+		fs, cache.NewObjectLRUDefault(), filesystem.Options{AlternatesFS: osfs.New("/")},
+	)}
 }
 
 // Module gives submodules the same treatment as the superproject. A submodule
@@ -203,44 +212,166 @@ func (s *compatStorage) Module(name string) (storage.Storer, error) {
 	}
 	module := newCompatStorage(moduleFS)
 	if _, err = module.Reference(plumbing.HEAD); errors.Is(err, plumbing.ErrReferenceNotFound) {
-		uncloned := &unclonedStorage{memory.NewStorage()}
+		uncloned := memory.NewStorage()
 		uncloned.ReferenceStorage[plumbing.HEAD] = plumbing.NewSymbolicReference(plumbing.HEAD, plumbing.Master)
 		return uncloned, nil
 	}
 	return module, nil
 }
 
-// unclonedStorage is the repository of a submodule that has no module
-// directory. It lets status tell that stand-in from a real repository.
-type unclonedStorage struct {
-	*memory.Storage
+type submoduleTree struct {
+	path     string
+	repo     *git.Repository
+	worktree *git.Worktree
 }
 
-// status is the worktree status plus a check go-git cannot make. A submodule
-// with no module directory reads as clean, which is wrong when its working tree
-// holds a repository of its own: an embedded one, or a gitfile that points
-// nowhere.
-func (s *repoState) status() (git.Status, error) {
-	submodules, err := s.worktree.Submodules()
+// worktreeDirty reports whether the working tree has changes. go-git's status
+// compares a submodule's HEAD with the index but never looks inside its working
+// tree, so worktreeDirty also descends into every populated submodule, nested
+// ones included. Like git status, which fails when it cannot read part of the
+// tree, it returns an error for such a part even when another part is dirty.
+func worktreeDirty(repo *git.Repository, worktree *git.Worktree) (bool, error) {
+	submodules, replaced, err := populatedSubmodules(repo, worktree)
 	if err != nil {
-		return nil, err
+		return false, err
 	}
+	status, err := worktree.Status()
+	if err != nil {
+		return false, err
+	}
+	dirty := replaced || !status.IsClean()
 	for _, submodule := range submodules {
-		repo, repoErr := submodule.Repository()
-		if errors.Is(repoErr, git.ErrSubmoduleNotInitialized) {
+		submoduleDirty, dirtyErr := worktreeDirty(submodule.repo, submodule.worktree)
+		if dirtyErr != nil {
+			return false, fmt.Errorf("submodule %s: %w", submodule.path, dirtyErr)
+		}
+		dirty = dirty || submoduleDirty
+	}
+	return dirty, nil
+}
+
+// populatedSubmodules returns each submodule whose directory holds a .git
+// entry, which is how git tells a populated submodule from an empty one, and
+// whether a submodule's path has been replaced by something other than a
+// directory, which is a change. Only a path with a gitlink in the index is a
+// submodule, whatever .gitmodules lists. A populated submodule that go-git has
+// no module repository for would read as clean, which is wrong when its
+// directory holds a repository of its own: an embedded one, or a gitfile that
+// points nowhere. Git refuses a symbolic link in place of a submodule.
+func populatedSubmodules(
+	repo *git.Repository, worktree *git.Worktree,
+) (populated []submoduleTree, replaced bool, err error) {
+	submodules, err := worktree.Submodules()
+	if err != nil || len(submodules) == 0 {
+		return nil, false, err
+	}
+	idx, err := repo.Storer.Index()
+	if err != nil {
+		return nil, false, err
+	}
+	// go-git lists submodules in map order.
+	slices.SortFunc(submodules, func(a, b *git.Submodule) int {
+		return strings.Compare(a.Config().Path, b.Config().Path)
+	})
+	for _, submodule := range submodules {
+		dir := submodule.Config().Path
+		if entry, entryErr := idx.Entry(dir); entryErr != nil || entry.Mode != filemode.Submodule {
+			continue
+		}
+		submoduleRepo, repoErr := submodule.Repository()
+		if repoErr != nil && !errors.Is(repoErr, git.ErrSubmoduleNotInitialized) {
+			return nil, false, fmt.Errorf("submodule %s: %w", dir, repoErr)
+		}
+		info, present, statErr := lstatPresent(worktree.Filesystem, dir)
+		if statErr != nil {
+			return nil, false, fmt.Errorf("submodule %s: %w", dir, statErr)
+		}
+		if !present {
+			continue
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return nil, false, fmt.Errorf("submodule %s: %w", dir, errSubmoduleSymlink)
+		}
+		if !info.IsDir() {
+			replaced = true
+			continue
+		}
+		_, hasGit, statErr := lstatPresent(worktree.Filesystem, path.Join(dir, ".git"))
+		if statErr != nil {
+			return nil, false, fmt.Errorf("submodule %s: %w", dir, statErr)
+		}
+		if !hasGit {
 			continue
 		}
 		if repoErr != nil {
-			return nil, repoErr
+			return nil, false, fmt.Errorf("submodule %s: %w", dir, errSubmoduleNotInit)
 		}
-		if _, uncloned := repo.Storer.(*unclonedStorage); !uncloned {
-			continue
+		submoduleWorktree, _ := submoduleRepo.Worktree() //nolint:errcheck // the repository was opened with a working tree
+		// The stand-in for a submodule that was never cloned is not a compatStorage.
+		module, isModule := submoduleRepo.Storer.(*compatStorage)
+		if !isModule || !namesModule(submoduleWorktree.Filesystem.Root(), module) {
+			return nil, false, fmt.Errorf("submodule %s: %w", dir, errSubmoduleRepository)
 		}
-		if _, lstatErr := s.worktree.Filesystem.Lstat(path.Join(submodule.Config().Path, ".git")); lstatErr == nil {
-			return nil, errSubmoduleRepository
+		if err = checkReadable(module.Filesystem(), "info/exclude"); err != nil {
+			return nil, false, fmt.Errorf("submodule %s: %w", dir, err)
 		}
+		submoduleWorktree.Filesystem = moduleExcludeFS{submoduleWorktree.Filesystem, module.Filesystem()}
+		populated = append(populated, submoduleTree{dir, submoduleRepo, submoduleWorktree})
 	}
-	return s.worktree.Status()
+	return populated, replaced, nil
+}
+
+// lstatPresent is Lstat for a path that may be absent: one that does not exist,
+// or lies below something that is not a directory, is not an error.
+func lstatPresent(fsys billy.Filesystem, name string) (info os.FileInfo, present bool, err error) {
+	info, err = fsys.Lstat(name)
+	if errors.Is(err, os.ErrNotExist) || errors.Is(err, syscall.ENOTDIR) {
+		return nil, false, nil
+	}
+	return info, err == nil, err
+}
+
+// moduleExcludeFS serves a submodule's exclude file to go-git, which looks for
+// it at .git/info/exclude in the working tree, where a submodule has only a
+// gitfile. Served from there it ranks below the .gitignore files, as in git;
+// Worktree.Excludes would rank above them.
+type moduleExcludeFS struct {
+	billy.Filesystem
+
+	module billy.Filesystem
+}
+
+func (f moduleExcludeFS) Open(name string) (billy.File, error) {
+	if filepath.ToSlash(name) == ".git/info/exclude" {
+		return f.module.Open("info/exclude")
+	}
+	return f.Filesystem.Open(name)
+}
+
+// checkReadable reports a file that exists but cannot be opened. go-git treats
+// an exclude file like that as absent.
+func checkReadable(fsys billy.Filesystem, name string) error {
+	file, err := fsys.Open(name)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	return file.Close()
+}
+
+// namesModule reports whether the .git entry in dir leads to the module
+// repository go-git reads for the submodule. Git follows the entry itself, so a
+// gitfile that names another repository gets that repository's status.
+func namesModule(dir string, module *compatStorage) bool {
+	dirs, _, err := gitDirAt(dir)
+	if err != nil {
+		return false
+	}
+	named, namedErr := os.Stat(dirs.gitDir)
+	read, readErr := os.Stat(module.Filesystem().Root())
+	return namedErr == nil && readErr == nil && os.SameFile(named, read)
 }
 
 func (s *compatStorage) Config() (*config.Config, error) {
@@ -411,16 +542,15 @@ func forward(state *repoState, opts *Options) (string, error) {
 	offBranch := anchor != targetHash
 	workspaceDirty := false
 	if !targetSet && !offBranch {
-		unprovable := &ExitError{exitIncompleteHistory, "local history cannot prove workspace state"}
+		const unprovable = "local history cannot prove workspace state"
 		if state.workspace == workspaceUnreachable {
-			return "", unprovable
+			return "", &ExitError{exitIncompleteHistory, unprovable}
 		}
 		if state.worktree != nil {
-			status, statusErr := state.status()
-			if statusErr != nil {
-				return "", unprovable
+			var statusErr error
+			if workspaceDirty, statusErr = worktreeDirty(state.repo, state.worktree); statusErr != nil {
+				return "", &ExitError{exitIncompleteHistory, unprovable + ": " + statusErr.Error()}
 			}
-			workspaceDirty = !status.IsClean()
 		}
 	}
 

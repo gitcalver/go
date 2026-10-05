@@ -3623,18 +3623,7 @@ func newSubmoduleRepos(t *testing.T, origin, upstream string) submoduleRepos {
 func TestDirtyCheckLeavesRepositoryUnchanged(t *testing.T) {
 	t.Parallel()
 	origin, upstream := newSubmoduleOrigin(t)
-	mustWrite := func(t *testing.T, path, content string) {
-		t.Helper()
-		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
-			t.Fatal(err)
-		}
-	}
-	for _, tc := range []struct {
-		name string
-		// setup returns the directory to run gitcalver in.
-		setup func(t *testing.T, r submoduleRepos) string
-		want  int
-	}{
+	runRepoCases(t, origin, upstream, []repoCase{
 		{"submodules not initialized", func(_ *testing.T, r submoduleRepos) string {
 			return r.super
 		}, 0},
@@ -3649,7 +3638,7 @@ func TestDirtyCheckLeavesRepositoryUnchanged(t *testing.T) {
 		{"initialized but not cloned, workspace dirty", func(t *testing.T, r submoduleRepos) string {
 			t.Helper()
 			r.git(r.super, "submodule", "init", "sub")
-			mustWrite(t, filepath.Join(r.super, "untracked.txt"), "x")
+			writeTestFile(t, filepath.Join(r.super, "untracked.txt"), "x")
 			return r.super
 		}, 2},
 		{"initialized, empty modules directory", func(t *testing.T, r submoduleRepos) string {
@@ -3680,6 +3669,22 @@ func TestDirtyCheckLeavesRepositoryUnchanged(t *testing.T) {
 			r.git(r.super, "submodule", "update", "--init", "sub")
 			return r.super
 		}, 0},
+		// go-git lists submodules in map order, and the two cases put the dirty
+		// one on either side of the one that cannot be read.
+		{"one submodule dirty, one with an unreadable index", func(t *testing.T, r submoduleRepos) string {
+			t.Helper()
+			r.git(r.super, "submodule", "update", "--init")
+			writeTestFile(t, filepath.Join(r.super, "sub", "untracked.txt"), "untracked\n")
+			writeTestFile(t, filepath.Join(r.super, ".git", "modules", "other", "index"), "corrupt")
+			return r.super
+		}, 4},
+		{"one submodule with an unreadable index, one dirty", func(t *testing.T, r submoduleRepos) string {
+			t.Helper()
+			r.git(r.super, "submodule", "update", "--init")
+			writeTestFile(t, filepath.Join(r.super, ".git", "modules", "sub", "index"), "corrupt")
+			writeTestFile(t, filepath.Join(r.super, "other", "untracked.txt"), "untracked\n")
+			return r.super
+		}, 4},
 		{"cloned at a new commit", func(_ *testing.T, r submoduleRepos) string {
 			r.git(r.super, "submodule", "update", "--init", "sub")
 			r.git(filepath.Join(r.super, "sub"), "commit", "-q", "--allow-empty", "-m", "newer")
@@ -3713,7 +3718,7 @@ func TestDirtyCheckLeavesRepositoryUnchanged(t *testing.T) {
 		}, 4},
 		{"malformed .gitmodules", func(t *testing.T, r submoduleRepos) string {
 			t.Helper()
-			mustWrite(t, filepath.Join(r.super, ".gitmodules"), "[submodule \"sub\"\n")
+			writeTestFile(t, filepath.Join(r.super, ".gitmodules"), "[submodule \"sub\"\n")
 			return r.super
 		}, 4},
 		{"submodule name escaping the git directory", func(t *testing.T, r submoduleRepos) string {
@@ -3723,7 +3728,7 @@ func TestDirtyCheckLeavesRepositoryUnchanged(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			mustWrite(t, gitmodules, strings.Replace(string(data), `[submodule "sub"]`, `[submodule "../../sub"]`, 1))
+			writeTestFile(t, gitmodules, strings.Replace(string(data), `[submodule "sub"]`, `[submodule "../../sub"]`, 1))
 			config, err := os.OpenFile(filepath.Join(r.super, ".git", "config"), os.O_APPEND|os.O_WRONLY, 0)
 			if err != nil {
 				t.Fatal(err)
@@ -3734,7 +3739,76 @@ func TestDirtyCheckLeavesRepositoryUnchanged(t *testing.T) {
 			}
 			return r.super
 		}, 4},
-	} {
+	})
+}
+
+// --- Changes inside submodules ---
+
+// newNestedSubmoduleOrigin makes a repository whose submodule "sub" has a
+// tracked file, an ignore rule for *.log except keep.log, and a submodule of its
+// own, "inner".
+// Nothing is checked out in a clone until a test calls checkout.
+func newNestedSubmoduleOrigin(t *testing.T) (origin, upstream string) {
+	t.Helper()
+	run := gitInDir(t)
+	root := t.TempDir()
+	upstream = filepath.Join(root, "upstream")
+	origin = filepath.Join(root, "origin")
+	inner := filepath.Join(upstream, "inner")
+	sub := filepath.Join(upstream, "sub")
+	for _, repo := range []string{inner, sub, origin} {
+		gitCLI(t, "init", "-q", "-b", "main", repo)
+	}
+	writeTestFile(t, filepath.Join(inner, "tracked.txt"), "inner\n")
+	run(inner, "add", "tracked.txt")
+	run(inner, "commit", "-q", "-m", "inner")
+	writeTestFile(t, filepath.Join(sub, "tracked.txt"), "sub\n")
+	writeTestFile(t, filepath.Join(sub, ".gitignore"), "*.log\n!keep.log\n")
+	run(sub, "add", "tracked.txt", ".gitignore")
+	run(sub, "commit", "-q", "-m", "sub")
+	run(sub, "submodule", "add", "-q", inner, "inner")
+	run(sub, "commit", "-q", "-m", "add inner")
+	run(origin, "commit", "-q", "--allow-empty", "-m", "base")
+	run(origin, "submodule", "add", "-q", sub, "sub")
+	run(origin, "commit", "-q", "-m", "add sub")
+	return origin, upstream
+}
+
+func writeTestFile(t *testing.T, path, content string) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func (r submoduleRepos) checkout() {
+	r.git(r.super, "submodule", "update", "--init", "--recursive")
+}
+
+func (r submoduleRepos) linked() string {
+	linked := filepath.Join(r.root, "linked")
+	r.git(r.super, "worktree", "add", "-q", "--detach", linked, "HEAD")
+	r.git(linked, "submodule", "update", "--init", "--recursive")
+	return linked
+}
+
+// setting commits a change to the superproject's .gitmodules, which would
+// otherwise make the superproject dirty by itself.
+func (r submoduleRepos) setting(key, value string) {
+	r.git(r.super, "config", "--file", ".gitmodules", key, value)
+	r.git(r.super, "commit", "-q", "-a", "-m", "setting")
+}
+
+type repoCase struct {
+	name string
+	// setup returns the directory to run gitcalver in.
+	setup func(t *testing.T, r submoduleRepos) string
+	want  int
+}
+
+func runRepoCases(t *testing.T, origin, upstream string, cases []repoCase) {
+	t.Helper()
+	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			repos := newSubmoduleRepos(t, origin, upstream)
@@ -3750,6 +3824,430 @@ func TestDirtyCheckLeavesRepositoryUnchanged(t *testing.T) {
 			}
 		})
 	}
+}
+
+func runNestedCases(t *testing.T, cases []repoCase) {
+	t.Helper()
+	origin, upstream := newNestedSubmoduleOrigin(t)
+	runRepoCases(t, origin, upstream, cases)
+}
+
+// go-git's status compares a submodule's HEAD with the index and never looks
+// inside its working tree, so the dirty check has to descend into it.
+func TestDirtyInsideSubmodule(t *testing.T) {
+	t.Parallel()
+	runNestedCases(t, []repoCase{
+		{"clean", func(_ *testing.T, r submoduleRepos) string {
+			r.checkout()
+			return r.super
+		}, 0},
+		{"tracked file modified", func(t *testing.T, r submoduleRepos) string {
+			t.Helper()
+			r.checkout()
+			writeTestFile(t, filepath.Join(r.super, "sub", "tracked.txt"), "changed\n")
+			return r.super
+		}, 2},
+		{"tracked file deleted", func(t *testing.T, r submoduleRepos) string {
+			t.Helper()
+			r.checkout()
+			if err := os.Remove(filepath.Join(r.super, "sub", "tracked.txt")); err != nil {
+				t.Fatal(err)
+			}
+			return r.super
+		}, 2},
+		{"change staged", func(t *testing.T, r submoduleRepos) string {
+			t.Helper()
+			r.checkout()
+			writeTestFile(t, filepath.Join(r.super, "sub", "tracked.txt"), "changed\n")
+			r.git(filepath.Join(r.super, "sub"), "add", "tracked.txt")
+			return r.super
+		}, 2},
+		{"new file staged", func(t *testing.T, r submoduleRepos) string {
+			t.Helper()
+			r.checkout()
+			writeTestFile(t, filepath.Join(r.super, "sub", "added.txt"), "added\n")
+			r.git(filepath.Join(r.super, "sub"), "add", "added.txt")
+			return r.super
+		}, 2},
+		{"untracked file", func(t *testing.T, r submoduleRepos) string {
+			t.Helper()
+			r.checkout()
+			writeTestFile(t, filepath.Join(r.super, "sub", "untracked.txt"), "untracked\n")
+			return r.super
+		}, 2},
+		{"untracked file in a new directory", func(t *testing.T, r submoduleRepos) string {
+			t.Helper()
+			r.checkout()
+			if err := os.Mkdir(filepath.Join(r.super, "sub", "new"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			writeTestFile(t, filepath.Join(r.super, "sub", "new", "untracked.txt"), "untracked\n")
+			return r.super
+		}, 2},
+		{"ignored file", func(t *testing.T, r submoduleRepos) string {
+			t.Helper()
+			r.checkout()
+			writeTestFile(t, filepath.Join(r.super, "sub", "debug.log"), "ignored\n")
+			return r.super
+		}, 0},
+		{"new commit", func(_ *testing.T, r submoduleRepos) string {
+			r.checkout()
+			r.git(filepath.Join(r.super, "sub"), "commit", "-q", "--allow-empty", "-m", "newer")
+			return r.super
+		}, 2},
+		{"nested submodule: tracked file modified", func(t *testing.T, r submoduleRepos) string {
+			t.Helper()
+			r.checkout()
+			writeTestFile(t, filepath.Join(r.super, "sub", "inner", "tracked.txt"), "changed\n")
+			return r.super
+		}, 2},
+		{"nested submodule: untracked file", func(t *testing.T, r submoduleRepos) string {
+			t.Helper()
+			r.checkout()
+			writeTestFile(t, filepath.Join(r.super, "sub", "inner", "untracked.txt"), "untracked\n")
+			return r.super
+		}, 2},
+		{"nested submodule: new commit", func(_ *testing.T, r submoduleRepos) string {
+			r.checkout()
+			r.git(filepath.Join(r.super, "sub", "inner"), "commit", "-q", "--allow-empty", "-m", "newer")
+			return r.super
+		}, 2},
+		{"linked worktree: clean", func(_ *testing.T, r submoduleRepos) string {
+			return r.linked()
+		}, 0},
+		{"linked worktree: tracked file modified", func(t *testing.T, r submoduleRepos) string {
+			t.Helper()
+			linked := r.linked()
+			writeTestFile(t, filepath.Join(linked, "sub", "tracked.txt"), "changed\n")
+			return linked
+		}, 2},
+		{"linked worktree: nested submodule untracked file", func(t *testing.T, r submoduleRepos) string {
+			t.Helper()
+			linked := r.linked()
+			writeTestFile(t, filepath.Join(linked, "sub", "inner", "untracked.txt"), "untracked\n")
+			return linked
+		}, 2},
+	})
+}
+
+// Git inspects a submodule when its directory holds a .git entry, and so does
+// gitcalver. Where it cannot read the repository that entry names, it cannot
+// tell whether the workspace is clean.
+func TestSubmoduleDirectoryState(t *testing.T) {
+	t.Parallel()
+	runNestedCases(t, []repoCase{
+		{"not initialized", func(_ *testing.T, r submoduleRepos) string {
+			return r.super
+		}, 0},
+		{"nested submodule not initialized", func(_ *testing.T, r submoduleRepos) string {
+			r.git(r.super, "submodule", "update", "--init", "sub")
+			return r.super
+		}, 0},
+		{"nested submodule initialized but not cloned", func(_ *testing.T, r submoduleRepos) string {
+			r.git(r.super, "submodule", "update", "--init", "sub")
+			r.git(filepath.Join(r.super, "sub"), "submodule", "init", "inner")
+			return r.super
+		}, 0},
+		{"directory emptied", func(t *testing.T, r submoduleRepos) string {
+			t.Helper()
+			r.checkout()
+			sub := filepath.Join(r.super, "sub")
+			if err := os.RemoveAll(sub); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Mkdir(sub, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			return r.super
+		}, 0},
+		{"files removed but the gitfile kept", func(t *testing.T, r submoduleRepos) string {
+			t.Helper()
+			r.checkout()
+			sub := filepath.Join(r.super, "sub")
+			entries, err := os.ReadDir(sub)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, entry := range entries {
+				if entry.Name() == ".git" {
+					continue
+				}
+				if err = os.RemoveAll(filepath.Join(sub, entry.Name())); err != nil {
+					t.Fatal(err)
+				}
+			}
+			return r.super
+		}, 2},
+		{"index unreadable", func(t *testing.T, r submoduleRepos) string {
+			t.Helper()
+			r.checkout()
+			writeTestFile(t, filepath.Join(r.super, ".git", "modules", "sub", "index"), "corrupt")
+			return r.super
+		}, 4},
+		{"gitfile with an absolute path", func(t *testing.T, r submoduleRepos) string {
+			t.Helper()
+			r.checkout()
+			module := filepath.Join(r.super, ".git", "modules", "sub")
+			writeTestFile(t, filepath.Join(r.super, "sub", ".git"), "gitdir: "+module+"\n")
+			return r.super
+		}, 0},
+		{"gitfile naming another repository", func(t *testing.T, r submoduleRepos) string {
+			t.Helper()
+			r.checkout()
+			other := filepath.Join(r.super, ".git", "modules", "other")
+			r.git(r.root, "clone", "-q", "--bare", filepath.Join(r.upstream, "sub"), other)
+			writeTestFile(t, filepath.Join(r.super, "sub", ".git"), "gitdir: "+other+"\n")
+			return r.super
+		}, 4},
+		{"gitfile invalid", func(t *testing.T, r submoduleRepos) string {
+			t.Helper()
+			r.checkout()
+			writeTestFile(t, filepath.Join(r.super, "sub", ".git"), "invalid\n")
+			return r.super
+		}, 4},
+		{"replaced by a file", func(t *testing.T, r submoduleRepos) string {
+			t.Helper()
+			r.checkout()
+			if err := os.RemoveAll(filepath.Join(r.super, "sub")); err != nil {
+				t.Fatal(err)
+			}
+			writeTestFile(t, filepath.Join(r.super, "sub"), "file\n")
+			return r.super
+		}, 2},
+		{"replaced by a symbolic link", func(t *testing.T, r submoduleRepos) string {
+			t.Helper()
+			r.checkout()
+			if err := os.Rename(filepath.Join(r.super, "sub"), filepath.Join(r.super, "moved")); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink("moved", filepath.Join(r.super, "sub")); err != nil {
+				t.Fatal(err)
+			}
+			return r.super
+		}, 4},
+		{"repository in the directory of a submodule that is not initialized", func(t *testing.T, r submoduleRepos) string {
+			t.Helper()
+			r.git(r.root, "clone", "-q", filepath.Join(r.upstream, "sub"), filepath.Join(r.super, "sub"))
+			writeTestFile(t, filepath.Join(r.super, "sub", "tracked.txt"), "changed\n")
+			return r.super
+		}, 4},
+		{"gitfile naming the module through a symbolic link", func(t *testing.T, r submoduleRepos) string {
+			t.Helper()
+			r.checkout()
+			alias := filepath.Join(r.root, "alias")
+			if err := os.Symlink(filepath.Join(r.super, ".git", "modules", "sub"), alias); err != nil {
+				t.Fatal(err)
+			}
+			writeTestFile(t, filepath.Join(r.super, "sub", ".git"), "gitdir: "+alias+"\n")
+			return r.super
+		}, 0},
+		{"index unreadable, superproject dirty", func(t *testing.T, r submoduleRepos) string {
+			t.Helper()
+			r.checkout()
+			writeTestFile(t, filepath.Join(r.super, "untracked.txt"), "untracked\n")
+			writeTestFile(t, filepath.Join(r.super, ".git", "modules", "sub", "index"), "corrupt")
+			return r.super
+		}, 4},
+		{"nested submodule index unreadable", func(t *testing.T, r submoduleRepos) string {
+			t.Helper()
+			r.checkout()
+			writeTestFile(t, filepath.Join(r.super, ".git", "modules", "sub", "modules", "inner", "index"), "corrupt")
+			return r.super
+		}, 4},
+		{"replaced by a file, superproject index unreadable", func(t *testing.T, r submoduleRepos) string {
+			t.Helper()
+			r.checkout()
+			if err := os.RemoveAll(filepath.Join(r.super, "sub")); err != nil {
+				t.Fatal(err)
+			}
+			writeTestFile(t, filepath.Join(r.super, "sub"), "file\n")
+			writeTestFile(t, filepath.Join(r.super, ".git", "index"), "corrupt")
+			return r.super
+		}, 4},
+		{"section in .gitmodules without a path", func(_ *testing.T, r submoduleRepos) string {
+			r.checkout()
+			r.setting("submodule.ghost.url", "./ghost")
+			return r.super
+		}, 0},
+		{"section in .gitmodules for the repository root", func(_ *testing.T, r submoduleRepos) string {
+			r.checkout()
+			r.setting("submodule.ghost.url", "./ghost")
+			r.setting("submodule.ghost.path", ".")
+			return r.super
+		}, 0},
+		{"gitlink path too long to exist", func(_ *testing.T, r submoduleRepos) string {
+			name := strings.Repeat("x", 300)
+			r.git(r.super, "update-index", "--add", "--cacheinfo", "160000,"+strings.Repeat("1", 40)+","+name)
+			r.git(r.super, "config", "--file", ".gitmodules", "submodule.long.path", name)
+			r.git(r.super, "config", "--file", ".gitmodules", "submodule.long.url", "./long")
+			r.git(r.super, "add", ".gitmodules")
+			r.git(r.super, "commit", "-q", "-m", "long")
+			return r.super
+		}, 4},
+	})
+}
+
+func TestSubmoduleDirectoryWithoutSearchPermission(t *testing.T) {
+	t.Parallel()
+	origin, upstream := newSubmoduleOrigin(t)
+	r := newSubmoduleRepos(t, origin, upstream)
+	r.git(r.super, "submodule", "update", "--init", "sub")
+	sub := filepath.Join(r.super, "sub")
+	if err := os.Chmod(sub, 0); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(sub, 0o755) })
+
+	out, code := runCmd(t, r.super)
+	assertEqual(t, 4, code)
+	if !strings.HasPrefix(out, "gitcalver: local history cannot prove workspace state: submodule sub: ") {
+		t.Errorf("unexpected message: %s", out)
+	}
+}
+
+func TestSubmoduleInsideReplacedDirectory(t *testing.T) {
+	t.Parallel()
+	dir := submoduleRepo(t)
+	if err := os.RemoveAll(filepath.Join(dir, "libs")); err != nil {
+		t.Fatal(err)
+	}
+	writeTestFile(t, filepath.Join(dir, "libs"), "file\n")
+
+	out, code := runCmd(t, dir)
+	assertEqual(t, 2, code)
+	assertEqual(t, "gitcalver: workspace is dirty; use --dirty to allow", out)
+}
+
+// go-git looks for a repository's exclude file under .git in the working tree,
+// which is a file in a submodule, so gitcalver reads the one in the module
+// directory.
+func TestSubmoduleExcludeFile(t *testing.T) {
+	t.Parallel()
+	exclude := func(r submoduleRepos, module string) string {
+		return filepath.Join(r.super, ".git", "modules", module, "info", "exclude")
+	}
+	runNestedCases(t, []repoCase{
+		{"file ignored by the exclude file", func(t *testing.T, r submoduleRepos) string {
+			t.Helper()
+			r.checkout()
+			writeTestFile(t, exclude(r, "sub"), "# local\n\n*.tmp\n")
+			writeTestFile(t, filepath.Join(r.super, "sub", "scratch.tmp"), "ignored\n")
+			return r.super
+		}, 0},
+		{"file ignored by the exclude file of a nested submodule", func(t *testing.T, r submoduleRepos) string {
+			t.Helper()
+			r.checkout()
+			writeTestFile(t, exclude(r, filepath.Join("sub", "modules", "inner")), "*.tmp\n")
+			writeTestFile(t, filepath.Join(r.super, "sub", "inner", "scratch.tmp"), "ignored\n")
+			return r.super
+		}, 0},
+		{"file ignored in a linked worktree", func(t *testing.T, r submoduleRepos) string {
+			t.Helper()
+			linked := r.linked()
+			module := filepath.Join(r.super, ".git", "worktrees", "linked", "modules", "sub")
+			writeTestFile(t, filepath.Join(module, "info", "exclude"), "*.tmp\n")
+			writeTestFile(t, filepath.Join(linked, "sub", "scratch.tmp"), "ignored\n")
+			return linked
+		}, 0},
+		{"file the exclude file ignores but a .gitignore file includes", func(t *testing.T, r submoduleRepos) string {
+			t.Helper()
+			r.checkout()
+			writeTestFile(t, exclude(r, "sub"), "keep.log\n")
+			writeTestFile(t, filepath.Join(r.super, "sub", "keep.log"), "untracked\n")
+			return r.super
+		}, 2},
+		{"file the exclude file does not match", func(t *testing.T, r submoduleRepos) string {
+			t.Helper()
+			r.checkout()
+			writeTestFile(t, exclude(r, "sub"), "*.tmp\n")
+			writeTestFile(t, filepath.Join(r.super, "sub", "scratch.txt"), "untracked\n")
+			return r.super
+		}, 2},
+		{"no exclude file", func(t *testing.T, r submoduleRepos) string {
+			t.Helper()
+			r.checkout()
+			if err := os.Remove(exclude(r, "sub")); err != nil {
+				t.Fatal(err)
+			}
+			writeTestFile(t, filepath.Join(r.super, "sub", "scratch.tmp"), "untracked\n")
+			return r.super
+		}, 2},
+		{"info is a file", func(t *testing.T, r submoduleRepos) string {
+			t.Helper()
+			r.checkout()
+			info := filepath.Dir(exclude(r, "sub"))
+			if err := os.RemoveAll(info); err != nil {
+				t.Fatal(err)
+			}
+			writeTestFile(t, info, "file\n")
+			return r.super
+		}, 4},
+	})
+}
+
+// A submodule cloned with --reference holds no objects of its own, only an
+// alternates file with an absolute path.
+func TestSubmoduleObjectsFromAlternates(t *testing.T) {
+	t.Parallel()
+	origin, upstream := newSubmoduleOrigin(t)
+	runRepoCases(t, origin, upstream, []repoCase{
+		{"clean", func(_ *testing.T, r submoduleRepos) string {
+			referenceSubmodule(r)
+			return r.super
+		}, 0},
+		{"untracked file", func(t *testing.T, r submoduleRepos) string {
+			t.Helper()
+			referenceSubmodule(r)
+			writeTestFile(t, filepath.Join(r.super, "sub", "untracked.txt"), "untracked\n")
+			return r.super
+		}, 2},
+	})
+}
+
+func referenceSubmodule(r submoduleRepos) {
+	sub := filepath.Join(r.upstream, "sub")
+	reference := filepath.Join(r.root, "reference.git")
+	r.git(r.root, "clone", "-q", "--bare", sub, reference)
+	r.git(r.super, "submodule", "init", "sub")
+	r.git(r.super, "config", "submodule.sub.url", "file://"+sub)
+	r.git(r.super, "submodule", "update", "--reference", reference, "sub")
+}
+
+// Git hides a submodule's changes from status when one of these settings is
+// present. A version describes the whole workspace, so gitcalver still counts
+// the changes.
+func TestSubmoduleSettingsDoNotHideChanges(t *testing.T) {
+	t.Parallel()
+	runNestedCases(t, []repoCase{
+		{"submodule.sub.ignore=all in the repository configuration", func(t *testing.T, r submoduleRepos) string {
+			t.Helper()
+			r.checkout()
+			r.git(r.super, "config", "submodule.sub.ignore", "all")
+			writeTestFile(t, filepath.Join(r.super, "sub", "tracked.txt"), "changed\n")
+			return r.super
+		}, 2},
+		{"submodule.sub.ignore=dirty in .gitmodules", func(t *testing.T, r submoduleRepos) string {
+			t.Helper()
+			r.checkout()
+			r.setting("submodule.sub.ignore", "dirty")
+			writeTestFile(t, filepath.Join(r.super, "sub", "untracked.txt"), "untracked\n")
+			return r.super
+		}, 2},
+		{"diff.ignoreSubmodules=all", func(t *testing.T, r submoduleRepos) string {
+			t.Helper()
+			r.checkout()
+			r.git(r.super, "config", "diff.ignoreSubmodules", "all")
+			writeTestFile(t, filepath.Join(r.super, "sub", "tracked.txt"), "changed\n")
+			return r.super
+		}, 2},
+		{"status.showUntrackedFiles=no", func(t *testing.T, r submoduleRepos) string {
+			t.Helper()
+			r.checkout()
+			r.git(r.super, "config", "status.showUntrackedFiles", "no")
+			writeTestFile(t, filepath.Join(r.super, "sub", "untracked.txt"), "untracked\n")
+			return r.super
+		}, 2},
+	})
 }
 
 // --- Helpers ---
