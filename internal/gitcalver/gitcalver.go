@@ -675,7 +675,13 @@ func gitDirAt(dir string) (gitDirectories, bool, error) {
 	info, err := os.Stat(dotGit)
 	if err == nil {
 		if info.IsDir() {
-			return namedGitDir(dotGit)
+			// Like git, pass over a .git directory that is not a git directory.
+			dirs, found, dirErr := gitDirIfValid(dotGit)
+			if found || dirErr != nil {
+				dirs.inGitDir = false
+				return dirs, found, dirErr
+			}
+			return gitDirIfValid(dir)
 		}
 		if !info.Mode().IsRegular() {
 			return gitDirectories{}, false, errInvalidGitFile

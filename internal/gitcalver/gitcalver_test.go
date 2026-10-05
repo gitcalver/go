@@ -3047,6 +3047,12 @@ func TestRepositoryDiscoveryLayouts(t *testing.T) {
 	mkdirs(stray, "commondir-without-objects")
 	write(headRef, stray, "commondir-without-objects", "HEAD")
 	write("../..\n", stray, "commondir-without-objects", "commondir")
+	mkdirs(stray, "empty-dot-git", ".git")
+	mkdirs(stray, "dot-git-without-refs", ".git", "objects")
+	write(headRef, stray, "dot-git-without-refs", ".git", "HEAD")
+	mkdirs(stray, "dot-git-garbage-head", ".git", "objects")
+	mkdirs(stray, "dot-git-garbage-head", ".git", "refs")
+	write("garbage\n", stray, "dot-git-garbage-head", ".git", "HEAD")
 
 	// Things git does treat as a repository. These are empty, so there are
 	// no commits to version.
@@ -3058,9 +3064,6 @@ func TestRepositoryDiscoveryLayouts(t *testing.T) {
 	write(strings.Repeat("a", 40)+"\n", stray, "detached-missing", "HEAD")
 
 	// git stops at an unreadable gitfile or commondir instead of searching on.
-	// An empty .git directory also stops the search, which git would pass over:
-	// a damaged repository is reported, not replaced by the one around it.
-	mkdirs(stray, "empty-dot-git", ".git")
 	mkdirs(stray, "bad-gitfile")
 	write("not a gitfile\n", stray, "bad-gitfile", ".git")
 	mkdirs(stray, "commondir-directory", "commondir")
@@ -3135,6 +3138,9 @@ func TestRepositoryDiscoveryLayouts(t *testing.T) {
 		{"garbage HEAD", filepath.Join(stray, "garbage-head"), nil, same("20260410.2", 0)},
 		{"non-hex detached HEAD", filepath.Join(stray, "non-hex-head"), nil, same("20260410.2", 0)},
 		{"HEAD ref outside refs", filepath.Join(stray, "head-outside-ref"), nil, same("20260410.2", 0)},
+		{"empty .git directory", filepath.Join(stray, "empty-dot-git"), nil, same("20260410.2", 0)},
+		{".git directory without refs", filepath.Join(stray, "dot-git-without-refs"), nil, same("20260410.2", 0)},
+		{".git directory with a garbage HEAD", filepath.Join(stray, "dot-git-garbage-head"), nil, same("20260410.2", 0)},
 
 		{"empty bare repository", filepath.Join(stray, "empty-bare"), nil, same("gitcalver: no commits in repository", 1)},
 		{
@@ -3147,7 +3153,6 @@ func TestRepositoryDiscoveryLayouts(t *testing.T) {
 			"unreadable commondir",
 			filepath.Join(stray, "commondir-directory"), nil, same("gitcalver: not a git repository", 1),
 		},
-		{"empty .git directory", filepath.Join(stray, "empty-dot-git"), nil, same("gitcalver: not a git repository", 1)},
 		{"linked worktree with a missing common directory", brokenLinked, nil, same("gitcalver: not a git repository", 1)},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

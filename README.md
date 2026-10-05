@@ -118,9 +118,8 @@ GitCalVer searches upward from the current directory, after resolving symlinks,
 and uses the repository at the first directory that has a `.git` directory or
 file, or is itself a Git directory. Unlike Git, it ignores `GIT_*` environment
 variables (including `GIT_DIR`, `GIT_WORK_TREE`, and `GIT_CEILING_DIRECTORIES`)
-and `core.worktree`, does not stop at filesystem boundaries or check ownership,
-and reports an error for a `.git` directory that is not a valid Git directory
-instead of skipping it.
+and `core.worktree`, and does not stop at filesystem boundaries or check
+ownership.
 
 A repository with `core.bare` set to true has no workspace to inspect, but its
 linked worktrees do. Inside the Git directory (usually `.git`) of a repository
