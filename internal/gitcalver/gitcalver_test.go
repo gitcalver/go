@@ -4,8 +4,11 @@
 package gitcalver
 
 import (
+	"crypto/sha256"
 	"errors"
 	"fmt"
+	"io/fs"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -3500,6 +3503,246 @@ func TestValidHEAD(t *testing.T) {
 				t.Fatal(err)
 			}
 			assertEqual(t, tc.want, validHEAD(head))
+		})
+	}
+}
+
+// --- The dirty check never writes to the repository ---
+
+// snapshotTree maps every path under dir to its mode and a hash of its content,
+// or to its link target.
+func snapshotTree(t *testing.T, dir string) map[string]string {
+	t.Helper()
+	snapshot := map[string]string{}
+	err := filepath.WalkDir(dir, func(path string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		rel, err := filepath.Rel(dir, path)
+		if err != nil {
+			return err
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		switch {
+		case info.Mode()&fs.ModeSymlink != 0:
+			target, linkErr := os.Readlink(path)
+			snapshot[rel] = "link " + target
+			return linkErr
+		case info.IsDir():
+			snapshot[rel] = "dir " + info.Mode().String()
+		default:
+			data, readErr := os.ReadFile(path)
+			sum := sha256.Sum256(data)
+			snapshot[rel] = fmt.Sprintf("%s %x", info.Mode(), sum)
+			return readErr
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return snapshot
+}
+
+func describeTreeChanges(before, after map[string]string) string {
+	var lines []string
+	for _, path := range slices.Sorted(maps.Keys(after)) {
+		if old, ok := before[path]; !ok {
+			lines = append(lines, "+ "+path)
+		} else if old != after[path] {
+			lines = append(lines, "~ "+path)
+		}
+	}
+	for _, path := range slices.Sorted(maps.Keys(before)) {
+		if _, ok := after[path]; !ok {
+			lines = append(lines, "- "+path)
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
+// submoduleRepos is a clone, super, of a repository whose main branch has two
+// submodules, "sub" and "other", neither initialized in the clone. root holds
+// everything the fixture creates, so a snapshot of it covers super and any
+// linked worktree made from it. upstream holds the submodules' repositories,
+// which every fixture shares.
+type submoduleRepos struct {
+	root, super, upstream string
+	git                   func(dir string, args ...string)
+}
+
+func gitInDir(t *testing.T) func(dir string, args ...string) {
+	t.Helper()
+	return func(dir string, args ...string) {
+		t.Helper()
+		gitCLI(t, append([]string{
+			"-C", dir,
+			"-c", "user.name=Test", "-c", "user.email=test@test.com",
+			"-c", "protocol.file.allow=always",
+		}, args...)...)
+	}
+}
+
+// newSubmoduleOrigin makes the repository that submoduleRepos clones, and the
+// repositories of its submodules.
+func newSubmoduleOrigin(t *testing.T) (origin, upstream string) {
+	t.Helper()
+	run := gitInDir(t)
+	root := t.TempDir()
+	upstream = filepath.Join(root, "upstream")
+	origin = filepath.Join(root, "origin")
+	gitCLI(t, "init", "-q", "-b", "main", origin)
+	run(origin, "commit", "-q", "--allow-empty", "-m", "base")
+	for _, name := range []string{"sub", "other"} {
+		repo := filepath.Join(upstream, name)
+		gitCLI(t, "init", "-q", "-b", "main", repo)
+		run(repo, "commit", "-q", "--allow-empty", "-m", name)
+		run(origin, "submodule", "add", "-q", repo, name)
+	}
+	run(origin, "commit", "-q", "-m", "add submodules")
+	return origin, upstream
+}
+
+func newSubmoduleRepos(t *testing.T, origin, upstream string) submoduleRepos {
+	t.Helper()
+	run := gitInDir(t)
+	root := t.TempDir()
+	super := filepath.Join(root, "super")
+	run(root, "clone", "-q", origin, super)
+	return submoduleRepos{root: root, super: super, upstream: upstream, git: run}
+}
+
+func TestDirtyCheckLeavesRepositoryUnchanged(t *testing.T) {
+	t.Parallel()
+	origin, upstream := newSubmoduleOrigin(t)
+	mustWrite := func(t *testing.T, path, content string) {
+		t.Helper()
+		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, tc := range []struct {
+		name string
+		// setup returns the directory to run gitcalver in.
+		setup func(t *testing.T, r submoduleRepos) string
+		want  int
+	}{
+		{"submodules not initialized", func(_ *testing.T, r submoduleRepos) string {
+			return r.super
+		}, 0},
+		{"submodule initialized but not cloned", func(_ *testing.T, r submoduleRepos) string {
+			r.git(r.super, "submodule", "init", "sub")
+			return r.super
+		}, 0},
+		{"every submodule initialized but not cloned", func(_ *testing.T, r submoduleRepos) string {
+			r.git(r.super, "submodule", "init")
+			return r.super
+		}, 0},
+		{"initialized but not cloned, workspace dirty", func(t *testing.T, r submoduleRepos) string {
+			t.Helper()
+			r.git(r.super, "submodule", "init", "sub")
+			mustWrite(t, filepath.Join(r.super, "untracked.txt"), "x")
+			return r.super
+		}, 2},
+		{"initialized, empty modules directory", func(t *testing.T, r submoduleRepos) string {
+			t.Helper()
+			r.git(r.super, "submodule", "init", "sub")
+			if err := os.MkdirAll(filepath.Join(r.super, ".git", "modules", "sub"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			return r.super
+		}, 0},
+		{"initialized, unparsable URL", func(_ *testing.T, r submoduleRepos) string {
+			r.git(r.super, "submodule", "init", "sub")
+			r.git(r.super, "config", "submodule.sub.url", "http://[::1")
+			return r.super
+		}, 0},
+		{"initialized in a linked worktree", func(_ *testing.T, r submoduleRepos) string {
+			linked := filepath.Join(r.root, "linked")
+			r.git(r.super, "worktree", "add", "-q", "--detach", linked, "HEAD")
+			r.git(linked, "submodule", "init", "sub")
+			return linked
+		}, 0},
+		{"one submodule cloned, one initialized only", func(_ *testing.T, r submoduleRepos) string {
+			r.git(r.super, "submodule", "init")
+			r.git(r.super, "submodule", "update", "sub")
+			return r.super
+		}, 0},
+		{"cloned", func(_ *testing.T, r submoduleRepos) string {
+			r.git(r.super, "submodule", "update", "--init", "sub")
+			return r.super
+		}, 0},
+		{"cloned at a new commit", func(_ *testing.T, r submoduleRepos) string {
+			r.git(r.super, "submodule", "update", "--init", "sub")
+			r.git(filepath.Join(r.super, "sub"), "commit", "-q", "--allow-empty", "-m", "newer")
+			return r.super
+		}, 2},
+		{"cloned, directory removed", func(t *testing.T, r submoduleRepos) string {
+			t.Helper()
+			r.git(r.super, "submodule", "update", "--init", "sub")
+			if err := os.RemoveAll(filepath.Join(r.super, "sub")); err != nil {
+				t.Fatal(err)
+			}
+			return r.super
+		}, 2},
+		{"deinitialized", func(_ *testing.T, r submoduleRepos) string {
+			r.git(r.super, "submodule", "update", "--init", "sub")
+			r.git(r.super, "submodule", "deinit", "-q", "sub")
+			return r.super
+		}, 0},
+		{"repository inside the submodule directory", func(_ *testing.T, r submoduleRepos) string {
+			r.git(r.super, "submodule", "init", "sub")
+			r.git(r.root, "clone", "-q", filepath.Join(r.upstream, "sub"), filepath.Join(r.super, "sub"))
+			return r.super
+		}, 4},
+		{"gitfile of a removed module repository", func(t *testing.T, r submoduleRepos) string {
+			t.Helper()
+			r.git(r.super, "submodule", "update", "--init", "sub")
+			if err := os.RemoveAll(filepath.Join(r.super, ".git", "modules")); err != nil {
+				t.Fatal(err)
+			}
+			return r.super
+		}, 4},
+		{"malformed .gitmodules", func(t *testing.T, r submoduleRepos) string {
+			t.Helper()
+			mustWrite(t, filepath.Join(r.super, ".gitmodules"), "[submodule \"sub\"\n")
+			return r.super
+		}, 4},
+		{"submodule name escaping the git directory", func(t *testing.T, r submoduleRepos) string {
+			t.Helper()
+			gitmodules := filepath.Join(r.super, ".gitmodules")
+			data, err := os.ReadFile(gitmodules)
+			if err != nil {
+				t.Fatal(err)
+			}
+			mustWrite(t, gitmodules, strings.Replace(string(data), `[submodule "sub"]`, `[submodule "../../sub"]`, 1))
+			config, err := os.OpenFile(filepath.Join(r.super, ".git", "config"), os.O_APPEND|os.O_WRONLY, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer config.Close()
+			if _, err = config.WriteString("[submodule \"../../sub\"]\n\turl = /nonexistent\n"); err != nil {
+				t.Fatal(err)
+			}
+			return r.super
+		}, 4},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			repos := newSubmoduleRepos(t, origin, upstream)
+			dir := tc.setup(t, repos)
+
+			before := snapshotTree(t, repos.root)
+			out, code := runCmd(t, dir)
+			if changes := describeTreeChanges(before, snapshotTree(t, repos.root)); changes != "" {
+				t.Errorf("dirty check wrote to the repository:\n%s", changes)
+			}
+			if code != tc.want {
+				t.Errorf("exit code %d, want %d: %s", code, tc.want, out)
+			}
 		})
 	}
 }

@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -27,6 +28,7 @@ import (
 	"github.com/go-git/go-git/v5/storage"
 	"github.com/go-git/go-git/v5/storage/filesystem"
 	"github.com/go-git/go-git/v5/storage/filesystem/dotgit"
+	"github.com/go-git/go-git/v5/storage/memory"
 )
 
 const (
@@ -49,8 +51,9 @@ const (
 var versionRe = regexp.MustCompile(`^(\d{8})\.([1-9]\d*)$`)
 
 var (
-	errInvalidGitFile = errors.New("invalid .git file")
-	errEmptyCommonDir = errors.New("empty commondir file")
+	errInvalidGitFile      = errors.New("invalid .git file")
+	errEmptyCommonDir      = errors.New("empty commondir file")
+	errSubmoduleRepository = errors.New("submodule repository is not under .git/modules")
 )
 
 var errBadBool = errors.New("bad boolean config value")
@@ -189,13 +192,55 @@ func newCompatStorage(fs billy.Filesystem) *compatStorage {
 	return &compatStorage{filesystem.NewStorage(fs, cache.NewObjectLRUDefault())}
 }
 
-// Module gives submodules the same treatment as the superproject.
+// Module gives submodules the same treatment as the superproject. A submodule
+// that was never cloned has no module directory, and go-git would create one
+// while reading the status. Git counts such a submodule clean, so it gets an
+// in-memory repository with an unborn HEAD, which go-git opens without writing.
 func (s *compatStorage) Module(name string) (storage.Storer, error) {
 	moduleFS, err := dotgit.New(s.Filesystem()).Module(name)
 	if err != nil {
 		return nil, err
 	}
-	return newCompatStorage(moduleFS), nil
+	module := newCompatStorage(moduleFS)
+	if _, err = module.Reference(plumbing.HEAD); errors.Is(err, plumbing.ErrReferenceNotFound) {
+		uncloned := &unclonedStorage{memory.NewStorage()}
+		uncloned.ReferenceStorage[plumbing.HEAD] = plumbing.NewSymbolicReference(plumbing.HEAD, plumbing.Master)
+		return uncloned, nil
+	}
+	return module, nil
+}
+
+// unclonedStorage is the repository of a submodule that has no module
+// directory. It lets status tell that stand-in from a real repository.
+type unclonedStorage struct {
+	*memory.Storage
+}
+
+// status is the worktree status plus a check go-git cannot make. A submodule
+// with no module directory reads as clean, which is wrong when its working tree
+// holds a repository of its own: an embedded one, or a gitfile that points
+// nowhere.
+func (s *repoState) status() (git.Status, error) {
+	submodules, err := s.worktree.Submodules()
+	if err != nil {
+		return nil, err
+	}
+	for _, submodule := range submodules {
+		repo, repoErr := submodule.Repository()
+		if errors.Is(repoErr, git.ErrSubmoduleNotInitialized) {
+			continue
+		}
+		if repoErr != nil {
+			return nil, repoErr
+		}
+		if _, uncloned := repo.Storer.(*unclonedStorage); !uncloned {
+			continue
+		}
+		if _, lstatErr := s.worktree.Filesystem.Lstat(path.Join(submodule.Config().Path, ".git")); lstatErr == nil {
+			return nil, errSubmoduleRepository
+		}
+	}
+	return s.worktree.Status()
 }
 
 func (s *compatStorage) Config() (*config.Config, error) {
@@ -371,7 +416,7 @@ func forward(state *repoState, opts *Options) (string, error) {
 			return "", unprovable
 		}
 		if state.worktree != nil {
-			status, statusErr := state.worktree.Status()
+			status, statusErr := state.status()
 			if statusErr != nil {
 				return "", unprovable
 			}
