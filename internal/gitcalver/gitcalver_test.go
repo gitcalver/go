@@ -3798,6 +3798,8 @@ func writeCommit(
 // from a hook point git at another repository, and global configuration such
 // as hooks changes what fixture commands do. It creates SHA-1 repositories with
 // the files ref format, the only formats go-git reads, unless told otherwise.
+// Background maintenance is off: it takes locks such as objects/maintenance.lock
+// after a command returns, which snapshot comparisons would see as writes.
 func gitCLI(t *testing.T, args ...string) {
 	t.Helper()
 	cmd := exec.Command("git", args...)
@@ -3805,6 +3807,9 @@ func gitCLI(t *testing.T, args ...string) {
 	cmd.Env = append(cmd.Env,
 		"GIT_CONFIG_GLOBAL="+os.DevNull,
 		"GIT_CONFIG_NOSYSTEM=1",
+		"GIT_CONFIG_COUNT=1",
+		"GIT_CONFIG_KEY_0=maintenance.auto",
+		"GIT_CONFIG_VALUE_0=false",
 		"GIT_DEFAULT_HASH=sha1",
 		"GIT_DEFAULT_REF_FORMAT=files",
 	)
