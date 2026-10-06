@@ -3742,6 +3742,53 @@ func TestDirtyCheckLeavesRepositoryUnchanged(t *testing.T) {
 	})
 }
 
+// go-git's status does not count an unmerged index entry as a change, so some
+// conflicts read clean unless the dirty check looks at the index itself.
+func TestUnresolvedMergeConflict(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name         string
+		other, local string
+	}{
+		{"content", "echo other > f.txt", "echo local > f.txt"},
+		{"modified here, deleted there", "git rm -q g.txt", "seq 1 40 | sed s/1/one/ > g.txt"},
+		{"deleted here, modified there", "seq 1 40 | sed s/1/one/ > g.txt", "git rm -q g.txt"},
+		{"deleted there, renamed here", "git rm -q g.txt", "git mv g.txt h.txt"},
+		{"renamed there, deleted here", "git mv g.txt h.txt", "git rm -q g.txt"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			dir := t.TempDir()
+			run := gitInDir(t)
+			shell := func(script string) {
+				t.Helper()
+				if output, err := exec.Command("sh", "-c", "cd "+dir+" && "+script).CombinedOutput(); err != nil {
+					t.Fatalf("%s: %v: %s", script, err, output)
+				}
+			}
+			gitCLI(t, "init", "-q", "-b", "main", dir)
+			shell("echo base > f.txt && seq 1 40 > g.txt")
+			run(dir, "add", ".")
+			run(dir, "commit", "-q", "-m", "base")
+			run(dir, "checkout", "-q", "-b", "other")
+			shell(tc.other)
+			run(dir, "add", "-A")
+			run(dir, "commit", "-q", "-m", "other")
+			run(dir, "checkout", "-q", "main")
+			shell(tc.local)
+			run(dir, "add", "-A")
+			run(dir, "commit", "-q", "-m", "local")
+			if output, err := exec.Command("git", "-C", dir, "merge", "other").CombinedOutput(); err == nil {
+				t.Fatalf("merge did not conflict: %s", output)
+			}
+
+			out, code := runCmd(t, dir)
+			assertEqual(t, 2, code)
+			assertEqual(t, "gitcalver: workspace is dirty; use --dirty to allow", out)
+		})
+	}
+}
+
 // --- Changes inside submodules ---
 
 // newNestedSubmoduleOrigin makes a repository whose submodule "sub" has a
@@ -3982,6 +4029,20 @@ func TestSubmoduleDirectoryState(t *testing.T) {
 			t.Helper()
 			r.checkout()
 			writeTestFile(t, filepath.Join(r.super, ".git", "modules", "sub", "index"), "corrupt")
+			return r.super
+		}, 4},
+		{"submodule commit object missing", func(t *testing.T, r submoduleRepos) string {
+			t.Helper()
+			r.checkout()
+			module := filepath.Join(r.super, ".git", "modules", "sub")
+			head, err := exec.Command("git", "--git-dir", module, "rev-parse", "HEAD").Output()
+			if err != nil {
+				t.Fatal(err)
+			}
+			hash := strings.TrimSpace(string(head))
+			if err = os.Remove(filepath.Join(module, "objects", hash[:2], hash[2:])); err != nil {
+				t.Fatal(err)
+			}
 			return r.super
 		}, 4},
 		{"gitfile with an absolute path", func(t *testing.T, r submoduleRepos) string {

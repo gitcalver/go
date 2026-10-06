@@ -27,6 +27,7 @@ import (
 	"github.com/go-git/go-git/v5/plumbing/cache"
 	"github.com/go-git/go-git/v5/plumbing/filemode"
 	cfgformat "github.com/go-git/go-git/v5/plumbing/format/config"
+	"github.com/go-git/go-git/v5/plumbing/format/index"
 	"github.com/go-git/go-git/v5/plumbing/object"
 	"github.com/go-git/go-git/v5/storage"
 	"github.com/go-git/go-git/v5/storage/filesystem"
@@ -231,7 +232,11 @@ type submoduleTree struct {
 // ones included. Like git status, which fails when it cannot read part of the
 // tree, it returns an error for such a part even when another part is dirty.
 func worktreeDirty(repo *git.Repository, worktree *git.Worktree) (bool, error) {
-	submodules, replaced, err := populatedSubmodules(repo, worktree)
+	idx, err := repo.Storer.Index()
+	if err != nil {
+		return false, err
+	}
+	submodules, replaced, err := populatedSubmodules(worktree, idx)
 	if err != nil {
 		return false, err
 	}
@@ -239,7 +244,7 @@ func worktreeDirty(repo *git.Repository, worktree *git.Worktree) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	dirty := replaced || !status.IsClean()
+	dirty := replaced || !status.IsClean() || hasUnmerged(idx)
 	for _, submodule := range submodules {
 		submoduleDirty, dirtyErr := worktreeDirty(submodule.repo, submodule.worktree)
 		if dirtyErr != nil {
@@ -248,6 +253,15 @@ func worktreeDirty(repo *git.Repository, worktree *git.Worktree) (bool, error) {
 		dirty = dirty || submoduleDirty
 	}
 	return dirty, nil
+}
+
+// hasUnmerged reports an unresolved merge conflict, which go-git's status does
+// not count as a change. A merged entry has stage 0; go-git's index.Merged is 1,
+// the ancestor stage of a conflict.
+func hasUnmerged(idx *index.Index) bool {
+	return slices.ContainsFunc(idx.Entries, func(entry *index.Entry) bool {
+		return entry.Stage != 0
+	})
 }
 
 // populatedSubmodules returns each submodule whose directory holds a .git
@@ -259,14 +273,10 @@ func worktreeDirty(repo *git.Repository, worktree *git.Worktree) (bool, error) {
 // directory holds a repository of its own: an embedded one, or a gitfile that
 // points nowhere. Git refuses a symbolic link in place of a submodule.
 func populatedSubmodules(
-	repo *git.Repository, worktree *git.Worktree,
+	worktree *git.Worktree, idx *index.Index,
 ) (populated []submoduleTree, replaced bool, err error) {
 	submodules, err := worktree.Submodules()
 	if err != nil || len(submodules) == 0 {
-		return nil, false, err
-	}
-	idx, err := repo.Storer.Index()
-	if err != nil {
 		return nil, false, err
 	}
 	// go-git lists submodules in map order.
