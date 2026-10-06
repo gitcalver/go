@@ -3792,8 +3792,12 @@ func TestUnresolvedMergeConflict(t *testing.T) {
 			shell(tc.local)
 			run(dir, "add", "-A")
 			run(dir, "commit", "-q", "-m", "local")
-			if output, err := exec.Command("git", "-C", dir, "merge", "other").CombinedOutput(); err == nil {
-				t.Fatalf("merge did not conflict: %s", output)
+			merge := exec.Command("git", "-C", dir, "-c", "user.name=Test", "-c", "user.email=test@test.com", "merge", "other")
+			merge.Env = append(os.Environ(), "GIT_CONFIG_GLOBAL="+os.DevNull, "GIT_CONFIG_NOSYSTEM=1")
+			output, err := merge.CombinedOutput()
+			var exitErr *exec.ExitError
+			if !errors.As(err, &exitErr) || exitErr.ExitCode() != 1 || !strings.Contains(string(output), "CONFLICT") {
+				t.Fatalf("merge did not stop on a conflict: %v: %s", err, output)
 			}
 
 			out, code := runCmd(t, dir)
