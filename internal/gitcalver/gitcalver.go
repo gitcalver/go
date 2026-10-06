@@ -60,6 +60,8 @@ var (
 	errSubmoduleRepository = errors.New("submodule repository is not under .git/modules")
 	errSubmoduleSymlink    = errors.New("submodule path is a symbolic link")
 	errSubmoduleNotInit    = errors.New("populated submodule is not initialized")
+	errWorktreeConfig      = errors.New(
+		"repositories with extensions.worktreeConfig, such as sparse checkouts, are not supported")
 )
 
 var errBadBool = errors.New("bad boolean config value")
@@ -148,6 +150,9 @@ func validateRepo(dir string) (*repoState, error) {
 	repo, workspace, err := openRepository(dirs)
 	if errors.Is(err, git.ErrSHA256NotSupported) {
 		return nil, &ExitError{exitError, "SHA-256 repositories are not supported"}
+	}
+	if errors.Is(err, errWorktreeConfig) {
+		return nil, &ExitError{exitError, errWorktreeConfig.Error()}
 	}
 	if err != nil {
 		return nil, &ExitError{exitError, "not a git repository"}
@@ -400,6 +405,9 @@ func (s *compatStorage) Config() (*config.Config, error) {
 	format := cfgformat.ObjectFormat(extensions.Option("objectformat"))
 	if format == cfgformat.SHA256 {
 		return nil, git.ErrSHA256NotSupported
+	}
+	if extensions.HasOption("worktreeConfig") {
+		return nil, errWorktreeConfig
 	}
 	// Filesystem storage reads a fresh Config value on every call. Removing
 	// extensions only from that in-memory value lets go-git inspect the

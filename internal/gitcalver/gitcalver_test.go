@@ -480,6 +480,20 @@ func TestSHA256RepositoryRejected(t *testing.T) {
 	}
 }
 
+func TestSparseCheckoutRejected(t *testing.T) {
+	t.Parallel()
+	dir, commitAt := testRepo(t)
+	commitAt("2026-04-10T09:00:00Z")
+	gitCLI(t, "-C", dir, "sparse-checkout", "init", "--cone")
+
+	for _, args := range [][]string{nil, {"HEAD"}, {"20260410.1"}} {
+		out, code := runCmd(t, dir, args...)
+		assertEqual(t, 1, code)
+		assertEqual(
+			t, "gitcalver: repositories with extensions.worktreeConfig, such as sparse checkouts, are not supported", out)
+	}
+}
+
 func TestExplicitSHA1RepositoryAccepted(t *testing.T) {
 	t.Parallel()
 	dir, commitAt := testRepo(t)

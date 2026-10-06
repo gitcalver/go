@@ -161,3 +161,10 @@ exit code 4; GitCalVer never fetches them during calculation.
 
 SHA-256 repositories are rejected with exit code 1 because `go-git` v5 cannot
 open them ([go-git#706](https://github.com/go-git/go-git/issues/706)).
+
+## Sparse checkouts
+
+Repositories with `extensions.worktreeConfig`, which `git sparse-checkout` and
+`git clone --sparse` enable, are rejected with exit code 1. `go-git` v5 cannot
+open them, and a new file in a directory the sparse checkout excludes would go
+unnoticed.
