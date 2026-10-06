@@ -72,14 +72,27 @@ Use `--no-dirty` to explicitly refuse dirty versions (overrides `--dirty`).
 
 Dirty versions are a convenience and are not necessarily unique.
 
+GitCalVer decides whether the workspace is dirty from the repository alone, so
+the same working tree gets the same answer on every machine. Ignored files are
+those matched by `.gitignore` files and by the repository's `info/exclude`.
+Nothing else is consulted: not `core.excludesFile` or a global ignore file, and
+not user, system, or repository settings such as `status.showUntrackedFiles`.
+A file you ignore globally still makes the workspace dirty; add it to
+`.gitignore` or `.git/info/exclude`, or use `--dirty`.
+
 Changes inside a populated submodule, at any depth, make the workspace dirty.
 Settings that hide them from `git status` (`submodule.<name>.ignore`,
-`diff.ignoreSubmodules`, `status.showUntrackedFiles`) do not apply. A
-submodule's ignore rules come from its `.gitignore` files and the `info/exclude`
-file in its git directory. A submodule directory that holds a repository
-GitCalVer cannot match to the submodule, such as a clone of its own, or a
-submodule that is populated but not initialized (`git submodule init` fixes
-that), exits with code 4, as does any part of a submodule it cannot read.
+`diff.ignoreSubmodules`) do not apply. A submodule's ignore rules come from its
+own `.gitignore` files and the `info/exclude` file in its git directory. A
+submodule directory that holds a repository GitCalVer cannot match to the
+submodule, such as a clone of its own, or a submodule that is populated but not
+initialized (`git submodule init` fixes that), exits with code 4, as does any
+part of a submodule it cannot read.
+
+Like Git, GitCalVer skips hashing a file whose recorded size and modification
+time are unchanged, but it compares fewer fields than Git does. An edit that
+keeps a file's size and restores its modification time, as some tools that
+preserve timestamps do, is not seen.
 
 ### Reverse lookup
 

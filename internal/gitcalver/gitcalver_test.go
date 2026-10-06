@@ -4246,6 +4246,65 @@ func TestSubmoduleExcludeFile(t *testing.T) {
 	})
 }
 
+// The exclude file lives in the git directory, which a linked worktree shares
+// with the repository it was made from.
+func TestRepositoryExcludeFile(t *testing.T) {
+	t.Parallel()
+	exclude := func(r submoduleRepos) string {
+		return filepath.Join(r.super, ".git", "info", "exclude")
+	}
+	runNestedCases(t, []repoCase{
+		{"file ignored in the repository", func(t *testing.T, r submoduleRepos) string {
+			t.Helper()
+			r.checkout()
+			writeTestFile(t, exclude(r), "*.tmp\n")
+			writeTestFile(t, filepath.Join(r.super, "scratch.tmp"), "ignored\n")
+			return r.super
+		}, 0},
+		{"file ignored in a linked worktree", func(t *testing.T, r submoduleRepos) string {
+			t.Helper()
+			linked := r.linked()
+			writeTestFile(t, exclude(r), "*.tmp\n")
+			writeTestFile(t, filepath.Join(linked, "scratch.tmp"), "ignored\n")
+			return linked
+		}, 0},
+		{"file ignored in a subdirectory of a linked worktree", func(t *testing.T, r submoduleRepos) string {
+			t.Helper()
+			linked := r.linked()
+			writeTestFile(t, exclude(r), "*.tmp\n")
+			if err := os.Mkdir(filepath.Join(linked, "dir"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			writeTestFile(t, filepath.Join(linked, "dir", "scratch.tmp"), "ignored\n")
+			return filepath.Join(linked, "dir")
+		}, 0},
+		{"file the exclude file does not match in a linked worktree", func(t *testing.T, r submoduleRepos) string {
+			t.Helper()
+			linked := r.linked()
+			writeTestFile(t, exclude(r), "*.tmp\n")
+			writeTestFile(t, filepath.Join(linked, "scratch.txt"), "untracked\n")
+			return linked
+		}, 2},
+		{"no exclude file in a linked worktree", func(t *testing.T, r submoduleRepos) string {
+			t.Helper()
+			linked := r.linked()
+			if err := os.Remove(exclude(r)); err != nil {
+				t.Fatal(err)
+			}
+			writeTestFile(t, filepath.Join(linked, "scratch.tmp"), "untracked\n")
+			return linked
+		}, 2},
+		{"info is a file", func(t *testing.T, r submoduleRepos) string {
+			t.Helper()
+			if err := os.RemoveAll(filepath.Dir(exclude(r))); err != nil {
+				t.Fatal(err)
+			}
+			writeTestFile(t, filepath.Dir(exclude(r)), "file\n")
+			return r.super
+		}, 1},
+	})
+}
+
 // A submodule cloned with --reference holds no objects of its own, only an
 // alternates file with an absolute path.
 func TestSubmoduleObjectsFromAlternates(t *testing.T) {

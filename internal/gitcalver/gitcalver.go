@@ -325,7 +325,7 @@ func populatedSubmodules(
 		if err = checkReadable(module.Filesystem(), "info/exclude"); err != nil {
 			return nil, false, fmt.Errorf("submodule %s: %w", dir, err)
 		}
-		submoduleWorktree.Filesystem = moduleExcludeFS{submoduleWorktree.Filesystem, module.Filesystem()}
+		submoduleWorktree.Filesystem = excludeFS{submoduleWorktree.Filesystem, module.Filesystem()}
 		populated = append(populated, submoduleTree{dir, submoduleRepo, submoduleWorktree})
 	}
 	return populated, replaced, nil
@@ -341,19 +341,20 @@ func lstatPresent(fsys billy.Filesystem, name string) (info os.FileInfo, present
 	return info, err == nil, err
 }
 
-// moduleExcludeFS serves a submodule's exclude file to go-git, which looks for
-// it at .git/info/exclude in the working tree, where a submodule has only a
-// gitfile. Served from there it ranks below the .gitignore files, as in git;
+// excludeFS serves a repository's exclude file to go-git, which looks for it at
+// .git/info/exclude in the working tree. A linked worktree or a submodule has
+// only a gitfile there, and the file lives in the git directory the gitfile
+// names. Served from there it ranks below the .gitignore files, as in git;
 // Worktree.Excludes would rank above them.
-type moduleExcludeFS struct {
+type excludeFS struct {
 	billy.Filesystem
 
-	module billy.Filesystem
+	gitDir billy.Filesystem
 }
 
-func (f moduleExcludeFS) Open(name string) (billy.File, error) {
+func (f excludeFS) Open(name string) (billy.File, error) {
 	if filepath.ToSlash(name) == ".git/info/exclude" {
-		return f.module.Open("info/exclude")
+		return f.gitDir.Open("info/exclude")
 	}
 	return f.Filesystem.Open(name)
 }
@@ -497,7 +498,11 @@ func openRepository(dirs gitDirectories) (*git.Repository, workspaceKind, error)
 		repo, openErr := git.Open(storer, nil)
 		return repo, workspace, openErr
 	}
-	repo, err := git.Open(storer, osfs.New(dirs.worktreeDir))
+	commonFS := osfs.New(dirs.commonDir)
+	if err = checkReadable(commonFS, "info/exclude"); err != nil {
+		return nil, workspaceNone, err
+	}
+	repo, err := git.Open(storer, excludeFS{osfs.New(dirs.worktreeDir), commonFS})
 	return repo, workspace, err
 }
 
