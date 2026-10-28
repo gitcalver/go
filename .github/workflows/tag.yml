@@ -22,7 +22,7 @@ jobs:
         with:
           fetch-depth: 0
           ref: ${{ github.event.workflow_run.head_sha }}
-      - uses: gitcalver/sh@857287da052d1437703ead1f7d2adc76a95451ba # v20260825.1
+      - uses: gitcalver/sh@7120f81ed76b73a797dd83e31ef0e74be43affda # v20261007.1
         with:
           prefix: 'v0.'
           remote: origin
