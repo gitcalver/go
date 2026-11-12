@@ -10,7 +10,7 @@ workflows:
         - 'actions/setup-go@v7.0.0'
     '.github/workflows/tag.yml':
         - 'actions/checkout@v7.0.1'
-        - 'gitcalver/sh@v20260825.1'
+        - 'gitcalver/sh@v20261007.1'
     '.github/workflows/zizmor.yml':
         - 'actions/checkout@v7.0.1'
         - 'zizmorcore/zizmor-action@v0.8.1'
@@ -25,9 +25,9 @@ dependencies:
         commit: 'sha1-b7ad1dad31e06c5925ef5d2fc7ad053ef454303e'
         owner_id: 44036562
         repo_id: 192624594
-    'gitcalver/sh@v20260825.1':
-        ref: 'v20260825.1'
-        commit: 'sha1-857287da052d1437703ead1f7d2adc76a95451ba'
+    'gitcalver/sh@v20261007.1':
+        ref: 'v20261007.1'
+        commit: 'sha1-7120f81ed76b73a797dd83e31ef0e74be43affda'
         owner_id: 275515140
         repo_id: 1210152021
     'github/codeql-action@9b3254085494b55a0f7c4c2b3d2d52cc712ce370':
