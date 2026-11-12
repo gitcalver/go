@@ -1,0 +1,8 @@
+# Copyright © 2026 Michael Shields
+# SPDX-License-Identifier: MIT
+
+self-hosted-runner:
+  labels:
+    - ubuntu-26.04
+    - ubuntu-26.04-arm
+    - xcode-27

@@ -1,29 +1,33 @@
 name: Tag
 on:
   workflow_run:
+    # zizmor: ignore[dangerous-triggers] Only successful pushes from this repository can tag releases.
     workflows: [CI]
     types: [completed]
     branches: [main]
 
-concurrency: release
+concurrency:
+  group: release
+  cancel-in-progress: false
 
 permissions: {}
 
 jobs:
   tag:
     if: >-
-      github.event.workflow_run.conclusion == 'success' &&
-      github.event.workflow_run.event == 'push'
+      github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_repository.full_name == github.repository
     runs-on: ubuntu-24.04
     permissions:
-      contents: write
+      contents: write # Creates release tags for the tested commit.
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@v7.0.1 # zizmor: ignore[artipacked] Release tags use the checkout credential.
         with:
           fetch-depth: 0
           ref: ${{ github.event.workflow_run.head_sha }}
-      - uses: gitcalver/sh@857287da052d1437703ead1f7d2adc76a95451ba # v20260825.1
+          persist-credentials: true
+      - uses: gitcalver/sh@v20260825.1
         with:
-          prefix: 'v0.'
+          prefix: "v0."
           remote: origin
-          tag: 'true'
+          tag: "true"
+    name: tag

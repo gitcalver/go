@@ -25,7 +25,7 @@ test-conformance: build
 	git -C "$(CONFORMANCE_DIR)" show "$(CONFORMANCE_SHA):test/test.sh" >"$$tmp"; \
 	GIT_DEFAULT_HASH=sha1 GIT_DEFAULT_REF_FORMAT=files GITCALVER="$(CURDIR)/gitcalver" sh "$$tmp"
 
-lint:
+lint: actions-lock-verify-local
 	go tool golangci-lint run
 
 fmt:
@@ -36,3 +36,17 @@ acceptance: test-conformance
 local-image:
 	cd container && go tool ko build --local --platform=linux/$(shell go env GOARCH) -B --tags=latest .
 	docker tag ko.local/container:latest gitcalver:latest
+
+.PHONY: actions-lock-install actions-lock actions-lock-verify-local actions-lock-verify
+
+actions-lock-install:
+	gh extension install github/gh-actions-lock --pin v0.4.1 --force
+
+actions-lock:
+	gh actions-lock --no-interactive
+
+actions-lock-verify-local:
+	gh actions-lock --verify-local
+
+actions-lock-verify:
+	gh actions-lock --verify
