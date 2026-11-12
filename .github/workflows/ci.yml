@@ -45,7 +45,7 @@ jobs:
       - run: make test
         env:
           GOTOOLCHAIN: local
-    name: test
+    name: test (${{ matrix.go-version }})
 
   conformance:
     runs-on: ubuntu-24.04
